@@ -28,7 +28,7 @@ internal static class Program
         if (!first) return 0;
 
         var log = new Logger(Path.GetDirectoryName(settings.FilePath)!, settings.DebugLog);
-        log.Info($"starting, processes=[{string.Join(",", settings.ProcessNames)}], mode={settings.Mode}, marker=U+{(int)settings.MarkerChar:X4}");
+        log.Info($"starting, processes=[{string.Join(",", settings.ProcessNames)}], marker=U+{(int)settings.MarkerChar:X4}");
 
         Regex namePattern = BuildPattern(settings.ChatNamePattern);
 

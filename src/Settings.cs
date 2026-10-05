@@ -2,21 +2,13 @@ using System;
 using System.Globalization;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ZoomBiDi;
-
-internal enum InsertMode
-{
-    /// <summary>Insert the marker only when the first letter typed on a line is Hebrew/Arabic.</summary>
-    RtlFirst,
-    /// <summary>Insert the marker at the start of every line, whatever language it starts with.</summary>
-    Always,
-}
 
 internal sealed class Settings
 {
     public bool Enabled { get; set; } = true;
-    public InsertMode Mode { get; set; } = InsertMode.RtlFirst;
 
     /// <summary>Hex code point of the character to insert. 2067 = RIGHT-TO-LEFT ISOLATE.</summary>
     public string MarkerHex { get; set; } = "2067";
@@ -38,6 +30,7 @@ internal sealed class Settings
     /// <summary>Testing only: also react to synthetic (SendInput) keystrokes from other programs.</summary>
     public bool ProcessInjectedInput { get; set; } = false;
 
+    [JsonIgnore]
     public char MarkerChar =>
         int.TryParse(MarkerHex.Trim().Replace("U+", "", StringComparison.OrdinalIgnoreCase),
             NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var cp) && cp is > 0 and <= 0xFFFF
@@ -50,9 +43,10 @@ internal sealed class Settings
     static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
-        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() },
+        Converters = { new JsonStringEnumConverter() },
     };
 
+    [JsonIgnore]
     public string FilePath { get; private set; } = Path.Combine(DefaultDirectory, "settings.json");
 
     public static Settings Load(string? path = null)

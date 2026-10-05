@@ -1,16 +1,16 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
-using System.Windows.Automation;
-using System.Windows.Automation.Text;
 
 namespace ZoomBiDi;
 
 internal enum CaretState
 {
-    /// <summary>Focused element is a chat box and the caret has only neutral characters before it on its line.</summary>
+    /// <summary>Focused element is a chat box and nothing precedes the caret on its line.</summary>
     LineStart,
     /// <summary>Focused element is a chat box, but the line already has content (or a direction mark).</summary>
     MidLine,
@@ -33,6 +33,7 @@ internal sealed class ChatInspector : IDisposable
     readonly Thread _thread;
     readonly Logger _log;
     readonly Func<Regex> _namePattern;
+    IUIAutomation? _uia;
 
     public ChatInspector(Logger log, Func<Regex> namePattern)
     {
@@ -60,56 +61,71 @@ internal sealed class ChatInspector : IDisposable
             var sw = Stopwatch.StartNew();
             CaretState result;
             string detail;
+            var com = new List<object>();
             try
             {
-                result = Inspect(req.ProcessId, out detail);
+                _uia ??= (IUIAutomation)new CUIAutomation();
+                result = Inspect(req.ProcessId, com, out detail);
             }
             catch (Exception ex)
             {
                 result = CaretState.Unknown;
                 detail = ex.GetType().Name + ": " + ex.Message;
             }
+            finally
+            {
+                // Release remote UIA objects right away instead of waiting for the GC.
+                foreach (var o in com) Marshal.FinalReleaseComObject(o);
+            }
             if (req.Callback is null) continue;
-            _log.Info($"check #{req.Id}: {result} in {sw.ElapsedMilliseconds} ms ({detail})");
+            if (_log.Enabled) _log.Info($"check #{req.Id}: {result} in {sw.ElapsedMilliseconds} ms ({detail})");
             req.Callback(req.Id, result);
         }
     }
 
-    CaretState Inspect(uint processId, out string detail)
+    static T Track<T>(List<object> com, T o) where T : class
     {
-        var el = AutomationElement.FocusedElement;
+        com.Add(o);
+        return o;
+    }
+
+    CaretState Inspect(uint processId, List<object> com, out string detail)
+    {
+        var el = _uia!.GetFocusedElement();
         if (el is null) { detail = "no focused element"; return CaretState.NotChat; }
+        Track(com, el);
 
-        var cur = el.Current;
         // Zoom's chat is an embedded WebView2: the text box lives in a child msedgewebview2.exe process.
-        if (!ProcessTree.IsSameOrDescendant((uint)cur.ProcessId, processId))
+        int pid = el.get_CurrentProcessId();
+        if (!ProcessTree.IsSameOrDescendant((uint)pid, processId))
         {
-            detail = $"focus in unrelated pid {cur.ProcessId}";
+            detail = $"focus in unrelated pid {pid}";
             return CaretState.NotChat;
         }
 
-        var type = cur.ControlType;
-        if (type != ControlType.Edit && type != ControlType.Document)
+        int type = el.get_CurrentControlType();
+        var name = el.get_CurrentName() ?? "";
+        if (type != Uia.UIA_EditControlTypeId && type != Uia.UIA_DocumentControlTypeId)
         {
-            detail = $"focus is {type.ProgrammaticName} '{cur.Name}'";
+            detail = $"focus is control type {type} '{name}'";
             return CaretState.NotChat;
         }
-        if (cur.IsPassword) { detail = "password box"; return CaretState.NotChat; }
-
-        var name = cur.Name ?? "";
+        if (el.GetCurrentPropertyValue(Uia.UIA_IsPasswordPropertyId) is true) { detail = "password box"; return CaretState.NotChat; }
         if (!_namePattern().IsMatch(name)) { detail = $"name '{name}' does not match"; return CaretState.NotChat; }
 
-        if (el.TryGetCurrentPattern(TextPattern.Pattern, out var tpObj) && tpObj is TextPattern tp)
+        if (el.GetCurrentPattern(Uia.UIA_TextPatternId) is IUIAutomationTextPattern tp)
         {
-            var selection = tp.GetSelection();
-            if (selection.Length > 0)
-                return Evaluate(tp, selection[0], out detail);
+            Track(com, tp);
+            var selection = Track(com, tp.GetSelection());
+            if (selection.get_Length() > 0)
+                return Evaluate(tp, Track(com, selection.GetElement(0)), com, out detail);
         }
 
-        if (el.TryGetCurrentPattern(ValuePattern.Pattern, out var vpObj) && vpObj is ValuePattern vp)
+        if (el.GetCurrentPattern(Uia.UIA_ValuePatternId) is IUIAutomationValuePattern vp)
         {
+            Track(com, vp);
             // No caret information: only an empty box is known to be "start of line".
-            var value = vp.Current.Value ?? "";
+            var value = vp.get_CurrentValue() ?? "";
             detail = $"value-only, len={value.Length}";
             return value.Length == 0 ? CaretState.LineStart : CaretState.MidLine;
         }
@@ -118,41 +134,50 @@ internal sealed class ChatInspector : IDisposable
         return CaretState.NotChat;
     }
 
-    static CaretState Evaluate(TextPattern tp, TextPatternRange caret, out string detail)
+    static CaretState Evaluate(IUIAutomationTextPattern tp, IUIAutomationTextRange caret, List<object> com, out string detail)
     {
         // 1) Text from the start of the box to the caret; look at what follows the last hard line break.
-        var before = tp.DocumentRange.Clone();
-        before.MoveEndpointByRange(TextPatternRangeEndpoint.End, caret, TextPatternRangeEndpoint.Start);
+        var before = Track(com, Track(com, tp.get_DocumentRange()).Clone());
+        before.MoveEndpointByRange(Uia.TextPatternRangeEndpoint_End, caret, Uia.TextPatternRangeEndpoint_Start);
         var text = before.GetText(-1) ?? "";
 
         int lineStart = text.Length;
         while (lineStart > 0 && !Bidi.IsLineBreak(text[lineStart - 1])) lineStart--;
+        var prefix = text[lineStart..];
 
-        var verdict = ClassifyPrefix(text, lineStart, out var firstNonNeutral);
-        if (verdict == CaretState.LineStart)
+        if (prefix.Length == 0)
         {
-            detail = $"line prefix '{Escape(text[lineStart..])}' is neutral";
+            // Caret at the start of a line that already begins with a mark (e.g. Home on a fixed line):
+            // step past the mark so the new text goes after it and the mark stays first.
+            var next = Track(com, caret.Clone());
+            next.MoveEndpointByUnit(Uia.TextPatternRangeEndpoint_End, Uia.TextUnit_Character, 1);
+            var after = next.GetText(1) ?? "";
+            if (after.Length > 0 && Bidi.IsDirectionMark(after[0]))
+            {
+                var moved = Track(com, caret.Clone());
+                moved.Move(Uia.TextUnit_Character, 1);
+                moved.Select();
+                detail = "caret was before the line's mark; moved past it";
+                return CaretState.MidLine;
+            }
+            detail = "nothing before the caret on this line";
             return CaretState.LineStart;
         }
-        if (verdict == CaretState.MidLine && Bidi.Classify(firstNonNeutral) == CharClass.DirectionMark)
-        {
-            detail = "line already has a direction mark";
-            return CaretState.MidLine;
-        }
-
         // 2) Chromium reports the caret on a new, empty last line as sitting *before* the trailing "\n",
-        //    so (1) still sees the previous line. Detect "caret is on an empty line" via the Line unit.
-        var line = caret.Clone();
-        line.ExpandToEnclosingUnit(TextUnit.Line);
+        //    so (1) still sees the previous line. Detect "caret is on an empty line" via the Line unit
+        //    (before looking at the prefix, which here belongs to the previous line).
+        var line = Track(com, caret.Clone());
+        line.ExpandToEnclosingUnit(Uia.TextUnit_Line);
         var lineText = line.GetText(64) ?? "";
-        bool emptyLine = lineText.Length == 0 || IsAllLineBreaks(lineText);
-        if (emptyLine)
+        if (lineText.Length == 0 || IsAllLineBreaks(lineText))
         {
             detail = "caret on an empty line";
             return CaretState.LineStart;
         }
 
-        detail = $"line prefix '{Escape(text[lineStart..])}' has content";
+        detail = prefix.IndexOfAny(Bidi.DirectionMarks) >= 0
+            ? "line already has a direction mark"
+            : $"line has content before the caret ('{Escape(prefix)}')";
         return CaretState.MidLine;
     }
 
@@ -161,20 +186,6 @@ internal sealed class ChatInspector : IDisposable
         foreach (var c in s)
             if (!Bidi.IsLineBreak(c)) return false;
         return true;
-    }
-
-    static CaretState ClassifyPrefix(string text, int start, out char firstNonNeutral)
-    {
-        for (int i = start; i < text.Length; i++)
-        {
-            if (Bidi.Classify(text[i]) != CharClass.Neutral)
-            {
-                firstNonNeutral = text[i];
-                return CaretState.MidLine;
-            }
-        }
-        firstNonNeutral = '\0';
-        return CaretState.LineStart;
     }
 
     static string Escape(string s)

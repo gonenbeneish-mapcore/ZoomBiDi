@@ -23,9 +23,11 @@ The known workaround is to type an invisible Unicode character, U+2067 (RIGHT-TO
 every line, which tells Zoom the line is right-to-left. ZoomBiDi does that for you automatically:
 
 * It runs quietly in the system tray.
-* When you start a line in a Zoom chat box with a Hebrew letter, it slips the invisible character in front of it.
-* Lines that start in English are left alone. Search boxes and other fields in Zoom aren't touched.
-* Outside Zoom it does nothing at all.
+* Every time you start a new line in a Zoom chat box, it slips the invisible character in at the start of the
+  line, whether you begin in Hebrew or in English ("meeting at 10 בבוקר" works too).
+* Search boxes and other fields in Zoom aren't touched. Outside Zoom it does nothing at all.
+* It's light: about 2 MB of memory while you're in other apps, about 17 MB while Zoom is in front, and no CPU
+  at all outside Zoom.
 
 You just type as usual.
 
@@ -47,14 +49,13 @@ Just chat in Zoom. Tray icon controls:
 
 * **Left-click**: pause / resume. Grey means paused.
 * **Right-click** for the menu:
-  * **Only when the line starts in Hebrew** (default), or **At the start of every line**
   * **Start with Windows**: launch ZoomBiDi automatically when you sign in
   * **Debug log** / **Open log**: see what it decided and why (useful if something doesn't work)
   * **Open settings file**
   * **Exit**
 
 **Privacy:** ZoomBiDi never connects to the network and never stores what you type. The optional debug log (off
-by default) records only the first letter of each new line and the short bit of text before the cursor.
+by default) records only the first character of each new line and the short bit of text before the cursor.
 
 ---
 
@@ -62,23 +63,29 @@ by default) records only the first letter of each new line and the short bit of 
 
 ### How it works
 
-* **Keyboard hook.** A low-level keyboard hook (`WH_KEYBOARD_LL`) runs on a dedicated thread. Keys are only
-  examined while a Zoom window is in the foreground, and each key is translated with the focused window's
-  keyboard layout (`ToUnicodeEx`).
-* **Cheap by default.** Ordinary typing passes straight through. The app only looks closer at the *first letter
-  after something that could have started a new line*: Enter, Backspace, arrows, Home/End, mouse clicks,
-  shortcuts (Ctrl+V…), or switching windows. Spaces, digits and punctuation don't count as that first letter.
-* **Checking the caret.** For a Hebrew first letter, the key is held while UI Automation inspects the focused
-  element (on a separate MTA thread). It checks three things:
+* **Hooks only while Zoom is in front.** Normally the only thing running is a cheap foreground-change
+  notification (`SetWinEventHook` with `EVENT_SYSTEM_FOREGROUND`). The low-level keyboard and mouse hooks
+  (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) are installed when a Zoom window comes to the front and removed when it
+  leaves, so typing in other apps never passes through ZoomBiDi. Hooks run on a dedicated thread, and each key
+  is translated with the focused window's keyboard layout (`ToUnicodeEx`).
+* **Cheap by default.** Ordinary typing passes straight through. The app only looks closer at the *first
+  character after something that could have started a new line*: Enter, Backspace, arrows, Home/End, mouse
+  clicks, shortcuts (Ctrl+V…), or switching windows.
+* **Checking the caret.** For that character, the key is held while UI Automation inspects the focused element.
+  This runs on a separate MTA thread, calling the UI Automation COM API directly. It checks three things:
   * The element is a Zoom message box: an Edit control whose accessible name matches `message` (Zoom names it
     "Message to …").
   * It belongs to Zoom, or to a child process of Zoom. Zoom's chat is an embedded WebView2, so the box lives in
     `msedgewebview2.exe`.
-  * Only neutral characters (spaces, digits, punctuation) sit between the start of the line and the caret, and
-    there is no direction mark yet. Chromium reports the caret on a new empty line as before the line break, so
-    an empty line is detected separately via the `TextUnit.Line` range.
+  * Nothing sits between the start of the line and the caret. Chromium reports the caret on a new empty line as
+    before the line break, so an empty line is detected separately via the `TextUnit.Line` range. If the caret
+    is right before the line's existing mark (Home on a line that's already fixed), it's moved past the mark
+    instead, so the mark stays first.
 * **Replay in order.** The held keys are then replayed with `SendInput`, with U+2067 in front when needed. A
   typical check takes 3–10 ms. Keys typed during the check are held too, and replayed in their original order.
+* **Small footprint.** Calling the UI Automation COM API directly, instead of the managed
+  `System.Windows.Automation` wrapper, means WPF is never loaded. ICU globalization data and background GC are
+  off. When Zoom leaves the foreground, the app compacts its heap and releases its working set.
 * **Never blocks.** Windows silently removes hooks that respond slowly, and the target app may need input to
   flow before it can answer UI Automation. So the hook callback never waits: results and timeouts arrive as
   messages on the hook thread. If UI Automation takes longer than `UiaTimeoutMs`, the keys are released
@@ -91,7 +98,6 @@ by default) records only the first letter of each new line and the short bit of 
 | Setting | Default | Meaning |
 |---|---|---|
 | `Enabled` | `true` | Same as the tray toggle |
-| `Mode` | `RtlFirst` | `RtlFirst` = only lines that start in Hebrew/Arabic; `Always` = every line |
 | `MarkerHex` | `2067` | Code point to insert (e.g. `200F` for RLM) |
 | `ProcessNames` | `["Zoom"]` | Processes (without `.exe`) treated as Zoom |
 | `ChatNamePattern` | `message` | Regex matched (case-insensitive) against the focused box's accessible name |

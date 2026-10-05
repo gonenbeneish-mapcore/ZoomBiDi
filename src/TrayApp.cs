@@ -17,7 +17,7 @@ internal sealed class TrayApp : ApplicationContext
     readonly KeyboardMonitor _monitor;
     readonly NotifyIcon _tray;
     readonly Icon _iconOn, _iconOff;
-    readonly ToolStripMenuItem _enabledItem, _rtlFirstItem, _alwaysItem, _startupItem, _debugItem;
+    readonly ToolStripMenuItem _enabledItem, _startupItem, _debugItem;
 
     public TrayApp(Settings settings, Logger log, KeyboardMonitor monitor)
     {
@@ -28,17 +28,11 @@ internal sealed class TrayApp : ApplicationContext
         _iconOff = LoadIcon("ZoomBiDi-paused.ico");
 
         _enabledItem = new ToolStripMenuItem("Enabled", null, (_, _) => SetEnabled(!_monitor.Enabled));
-        _rtlFirstItem = new ToolStripMenuItem("Only when the line starts in Hebrew", null, (_, _) => SetMode(InsertMode.RtlFirst));
-        _alwaysItem = new ToolStripMenuItem("At the start of every line", null, (_, _) => SetMode(InsertMode.Always));
         _startupItem = new ToolStripMenuItem("Start with Windows", null, (_, _) => ToggleStartup());
         _debugItem = new ToolStripMenuItem("Debug log", null, (_, _) => ToggleDebug());
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(_enabledItem);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem("Insert direction mark") { Enabled = false });
-        menu.Items.Add(_rtlFirstItem);
-        menu.Items.Add(_alwaysItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_startupItem);
         menu.Items.Add(_debugItem);
@@ -57,13 +51,6 @@ internal sealed class TrayApp : ApplicationContext
     {
         _monitor.Enabled = enabled;
         _settings.Enabled = enabled;
-        _settings.Save();
-        RefreshMenu();
-    }
-
-    void SetMode(InsertMode mode)
-    {
-        _settings.Mode = mode;
         _settings.Save();
         RefreshMenu();
     }
@@ -94,8 +81,6 @@ internal sealed class TrayApp : ApplicationContext
     {
         bool on = _monitor.Enabled;
         _enabledItem.Checked = on;
-        _rtlFirstItem.Checked = _settings.Mode == InsertMode.RtlFirst;
-        _alwaysItem.Checked = _settings.Mode == InsertMode.Always;
         _startupItem.Checked = IsStartupEnabled();
         _debugItem.Checked = _settings.DebugLog;
         _tray.Icon = on ? _iconOn : _iconOff;
