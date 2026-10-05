@@ -117,6 +117,10 @@ $greyBottom = [System.Drawing.Color]::FromArgb(0x5F, 0x66, 0x70)
 
 Write-Ico (Join-Path $OutDir 'ZoomBiDi.ico') $blueTop $blueMid $blueBottom
 Write-Ico (Join-Path $OutDir 'ZoomBiDi-paused.ico') $greyTop $greyMid $greyBottom
+# PNG for the README (GitHub doesn't reliably display .ico)
+$png = New-IconBitmap 256 $blueTop $blueMid $blueBottom
+$png.Save((Join-Path $OutDir 'ZoomBiDi.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+$png.Dispose()
 
 # Preview strip: every size, blue and grey, on light and dark backgrounds.
 $pw = 0; foreach ($s in $sizes) { $pw += $s + 16 }
