@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ZTDF-TEST</title>
+<style>
+  body { font: 16px "Segoe UI", sans-serif; margin: 16px; }
+  #box { border: 1px solid #888; min-height: 90px; padding: 6px; white-space: pre-wrap; font-size: 18px; }
+  #view { margin-top: 10px; padding: 6px; background: #f3f3f3; white-space: pre-wrap; min-height: 2em; font-size: 18px; }
+  .mark { background: #ffd54f; border-radius: 3px; padding: 0 3px; font-size: 12px; font-weight: 600; }
+  #history { margin-top: 14px; font-size: 15px; }
+  #history div { border-bottom: 1px solid #ddd; padding: 3px 0; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<p>Test chat box (stand-in for Zoom's chat input). Typed text:</p>
+<div id="box" contenteditable="true" dir="auto" role="textbox" aria-multiline="true"
+     aria-label="Message to test, Ctrl+Enter to send a message"></div>
+<p>Same text with invisible direction marks shown (<span class="mark">RLI</span> = U+2067):</p>
+<div id="view"></div>
+<p>History (each line = one test case, newest first):</p>
+<div id="history"></div>
+<script>
+  const box = document.getElementById('box');
+  const view = document.getElementById('view');
+  const history = document.getElementById('history');
+  const names = { 0x2066: 'LRI', 0x2067: 'RLI', 0x2068: 'FSI', 0x2069: 'PDI', 0x200E: 'LRM', 0x200F: 'RLM' };
+  function visualize(t, el) {
+    el.textContent = '';
+    for (const c of t) {
+      const n = names[c.codePointAt(0)];
+      if (n) { const s = document.createElement('span'); s.className = 'mark'; s.textContent = n; el.append(s); }
+      else el.append(c);
+    }
+  }
+  let last = '';
+  function update() {
+    const t = box.innerText.replace(/\n$/, '');
+    if (t === '' && last !== '') {
+      const d = document.createElement('div'); d.dir = 'auto'; visualize(last.replace(/\n/g, ' ⏎ '), d); history.prepend(d);
+    }
+    last = t;
+    visualize(t, view);
+    document.title = 'ZTDF-TEST|' + t.replace(/\n/g, '⏎');
+  }
+  box.addEventListener('input', update);
+  window.addEventListener('load', () => box.focus());
+  update();
+</script>
+</body>
+</html>
