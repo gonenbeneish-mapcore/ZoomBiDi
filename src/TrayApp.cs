@@ -37,7 +37,6 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add(_startupItem);
         menu.Items.Add(_debugItem);
         menu.Items.Add("Open log", null, (_, _) => OpenFile(_log.FilePath));
-        menu.Items.Add("Open settings file", null, (_, _) => OpenFile(_settings.FilePath));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => ExitThread());
         menu.Opening += (_, _) => RefreshMenu();

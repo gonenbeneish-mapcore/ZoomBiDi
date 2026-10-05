@@ -51,7 +51,6 @@ Just chat in Zoom. Tray icon controls:
 * **Right-click** for the menu:
   * **Start with Windows**: launch ZoomBiDi automatically when you sign in
   * **Debug log** / **Open log**: see what it decided and why (useful if something doesn't work)
-  * **Open settings file**
   * **Exit**
 
 **Privacy:** ZoomBiDi never connects to the network and never stores what you type. The optional debug log (off
@@ -93,7 +92,8 @@ by default) records only the first character of each new line and the short bit 
 
 ### Settings
 
-`%APPDATA%\ZoomBiDi\settings.json` (restart ZoomBiDi after editing):
+Advanced settings live in `%APPDATA%\ZoomBiDi\settings.json`. To open it, paste `%APPDATA%\ZoomBiDi` into
+the Explorer address bar. Restart ZoomBiDi after editing.
 
 | Setting | Default | Meaning |
 |---|---|---|
