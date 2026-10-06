@@ -114,6 +114,7 @@ function Type-Text([string]$s) {
     elseif ($c -eq [char]0x21E4) { [H]::Vk(0x24) }  # ⇤ = Home
     elseif ($c -eq [char]0x21F1) { [H]::ShiftHome() }  # ⇱ = Shift+Home
     elseif ($c -eq [char]0x24B6) { [H]::CtrlA() }  # Ⓐ = Ctrl+A
+    elseif ($c -eq [char]0x2325) { [H]::Vk(0x12) }  # ⌥ = Alt pressed and released alone
     elseif ($Mode -eq 'unicode') { [H]::Char($c) }
     else {
       if (Is-Hebrew $c) { Use-Layout $hebrew } elseif (Is-Latin $c) { Use-Layout $english }
@@ -131,7 +132,7 @@ function Clear-Box { Assert-Fg; [H]::CtrlA(); Start-Sleep -Milliseconds 80; Asse
 
 # Each expected line is "<alignment>|<text>" as the test page reports it (always L: ZoomBiDi doesn't align lines).
 # ^ marks where U+2068 should be inserted: at the start of every line.
-# `n = Enter, `b = Backspace, ← = Left arrow, ⇤ = Home.
+# `n = Enter, `b = Backspace, ← = Left arrow, ⇤ = Home, ⇱ = Shift+Home, Ⓐ = Ctrl+A, ⌥ = Alt tap.
 $cases = @(
   @{ name = 'hebrew only';                type = 'שלום לכולם';                        expect = 'L|^שלום לכולם' }
   @{ name = 'hebrew then english';        type = 'שלום world';                         expect = 'L|^שלום world' }
@@ -146,12 +147,15 @@ $cases = @(
   @{ name = 'backspace: only one marker'; type = "ש`bאבג";                             expect = 'L|^אבג' }
   @{ name = 'english erased, hebrew';     type = "ab`b`bשלום";                         expect = 'L|^שלום' }
   @{ name = 'edit mid-line: no marker';   type = "abc←←X";                             expect = 'L|^aXbc' }
-  @{ name = 'home on a fixed line';       type = "abc⇤X";                              expect = 'L|^Xabc' }
-  @{ name = 'home then hebrew';           type = "world⇤שלום ";                        expect = 'L|^שלום world' }
+  @{ name = 'home on a fixed line';       type = "abc⇤X";                              expect = 'L|X^abc' }
+  @{ name = 'home then hebrew';           type = "world⇤שלום ";                        expect = 'L|שלום ^world' }
   @{ name = 'capital after hebrew line';  type = "שלום`nHello there";                  expect = "L|^שלום`nL|^Hello there" }
   @{ name = 'digits, english after heb.'; type = "שלום`n10 am";                        expect = "L|^שלום`nL|^10 am" }
-  @{ name = 'select line, retype';        type = "abc⇱X";                              expect = 'L|^X' }
+  @{ name = 'select line, retype';        type = "abc⇱X";                              expect = 'L|X' }
   @{ name = 'select all, retype hebrew';  type = "abcⒶש";                              expect = 'L|^ש' }
+  @{ name = 'wrong layout, delete, retype'; type = "c`bבדיקה";                         expect = 'L|^בדיקה' }
+  @{ name = 'enter picks a mention';      type = "@ab`nשלום";                         expect = "L|^@ab`nL|שלום" }
+  @{ name = 'alt tap, then type';         type = "abc⌥d";                              expect = 'L|^abcd' }
   @{ name = 'burst: line + next line';    burst = "a`nשלום";                            expect = "L|^a`nL|^שלום" }
   @{ name = 'burst: digits then hebrew';  burst = '12 - שלום';                           expect = 'L|^12 - שלום' }
   @{ name = 'burst: capital next line';   burst = "x`nHello";                           expect = "L|^x`nL|^Hello" }

@@ -195,5 +195,8 @@ internal static class Native
     [DllImport("kernel32.dll", EntryPoint = "K32EmptyWorkingSet")]
     public static extern bool EmptyWorkingSet(IntPtr hProcess);
 
+    [DllImport("user32.dll")]
+    public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
     public static bool IsKeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
 }

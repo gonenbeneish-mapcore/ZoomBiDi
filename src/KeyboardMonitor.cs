@@ -41,7 +41,8 @@ internal sealed class KeyboardMonitor : IDisposable
     /// them (and updates what UI Automation reports) a little later.
     /// </summary>
     const int BacklogSettleMs = 40;
-    const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75;
+    const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75, VK_ESCAPE = 0x1B, VK_A = 0x41;
+    const uint GUI_INMENUMODE = 0x4, GUI_SYSTEMMENUMODE = 0x8, GUI_POPUPMENUMODE = 0x10;
 
     enum Phase
     {
@@ -64,7 +65,9 @@ internal sealed class KeyboardMonitor : IDisposable
         Dirty,
     }
 
-    readonly record struct HeldKey(KBDLLHOOKSTRUCT Data, bool Up, KeyKind Kind, char Char, bool IsEnter, bool FocusMove);
+    /// <param name="NewLine">Enter/Shift+Enter/Ctrl+Enter that starts a new line (or sends the message).</param>
+    /// <param name="SelectAll">Ctrl+A: the next character replaces everything.</param>
+    readonly record struct HeldKey(KBDLLHOOKSTRUCT Data, bool Up, KeyKind Kind, char Char, bool NewLine, bool SelectAll, bool FocusMove);
 
     [Flags]
     enum Mods { None = 0, Shift = 1, Ctrl = 2, Alt = 4, Win = 8 }
@@ -86,10 +89,17 @@ internal sealed class KeyboardMonitor : IDisposable
     IntPtr _foregroundHook, _keyboardHook, _mouseHook;
 
     // --- hook-thread state ---
-    /// <summary>The caret may be at the start of a line: check before the next character.</summary>
+    /// <summary>Something may have moved the caret or changed the box: check before the next character.</summary>
     bool _dirty = true;
-    /// <summary>The last caret-moving key was Enter (Zoom may still report the old line for a moment).</summary>
-    bool _afterEnter;
+    /// <summary>
+    /// The last caret-moving key started a new line (Enter, Shift+Enter, Ctrl+Enter), or was Ctrl+A: the next
+    /// character starts a line. Zoom doesn't expose the caret position, so this is tracked from the keys.
+    /// </summary>
+    bool _lineStartPending;
+    /// <summary>The word typed so far on this line ("@na" while picking a mention: Enter then picks it, not a new line).</summary>
+    readonly System.Text.StringBuilder _word = new();
+    /// <summary>Line start known for the check in progress.</summary>
+    bool _checkLineStart;
     /// <summary>Focus may have left the chat box since the last check (click, Tab, window switch).</summary>
     bool _focusMayHaveMoved = true;
     bool _enabled;
@@ -217,6 +227,8 @@ internal sealed class KeyboardMonitor : IDisposable
         bool isZoom = IsTargetProcess(pid);
         _dirty = true; // a window switch may land anywhere
         _focusMayHaveMoved = true;
+        _lineStartPending = false;
+        _word.Clear();
         if (isZoom && _enabled) _inspector.Prime(pid);
         _zoomInForeground = isZoom;
         ApplyHooks();
@@ -271,6 +283,8 @@ internal sealed class KeyboardMonitor : IDisposable
             {
                 _dirty = true; // a click may have moved the caret or switched chats
                 _focusMayHaveMoved = true;
+                _lineStartPending = false;
+                _word.Clear();
             }
         }
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -310,7 +324,7 @@ internal sealed class KeyboardMonitor : IDisposable
         if (_phase != Phase.Normal)
         {
             // Holding: keep order, and note what each key means using the modifier state the held keys produce.
-            var held = Describe(k, down, threadId, _heldMods);
+            var held = Arrive(k, down, threadId, _heldMods);
             UpdateMods(ref _heldMods, k.vkCode, down);
             _held.Add(held);
             return true;
@@ -320,7 +334,21 @@ internal sealed class KeyboardMonitor : IDisposable
         if ((k.flags & LLKHF_INJECTED) != 0 && !_settings.ProcessInjectedInput) return false;
         if (!IsTargetProcess(pid)) return false;
 
-        var key = Describe(k, true, threadId, PhysicalMods());
+        var key = Arrive(k, true, threadId, PhysicalMods());
+
+        // Switching keyboard language with Alt+Shift can leave Zoom's window in menu mode, where the next key is
+        // swallowed by the (invisible) window menu. Leave menu mode first, then pass the key on.
+        if (key.Kind != KeyKind.Neutral && k.vkCode != VK_ESCAPE && InMenuBarMode(threadId))
+        {
+            _log.Info($"Zoom's window is in menu mode: sending Escape before {DescribeForLog(key)}");
+            Send([KeyInput(VK_ESCAPE, keyUp: false), KeyInput(VK_ESCAPE, keyUp: true)]);
+            _held.Add(key);
+            _heldMods = PhysicalMods();
+            if (key.Kind == KeyKind.Printable && _dirty) StartCheck(pid);
+            else Replay(insertMarker: false, keepFrom: _held.Count);
+            return true;
+        }
+
         switch (key.Kind)
         {
             case KeyKind.Neutral:
@@ -342,9 +370,68 @@ internal sealed class KeyboardMonitor : IDisposable
     void MarkDirty(HeldKey key)
     {
         _dirty = true;
-        _afterEnter = key.IsEnter;
+        _lineStartPending = key.NewLine || key.SelectAll;
         if (key.FocusMove) _focusMayHaveMoved = true;
     }
+
+    /// <summary>
+    /// Describes a key as it arrives (arrival order = typing order, held or not) and keeps track of the word being
+    /// typed, so Enter after "@na" (picking a mention) or ":smi" (picking an emoji) isn't taken for a new line.
+    /// </summary>
+    HeldKey Arrive(KBDLLHOOKSTRUCT k, bool down, uint threadId, Mods mods)
+    {
+        var key = Describe(k, down, threadId, mods);
+        if (!down || key.Kind == KeyKind.Neutral) return key;
+
+        if (key.Kind == KeyKind.Printable)
+        {
+            if (char.IsWhiteSpace(key.Char)) _word.Clear();
+            else if (_word.Length < 64) _word.Append(key.Char);
+            return key;
+        }
+
+        // Caret-moving key.
+        if (key.NewLine && _word.Length > 0 && _word[0] is '@' or ':')
+            key = key with { NewLine = false }; // Enter picks from Zoom's mention/emoji list
+        if (k.vkCode == VK_BACK && key.Kind == KeyKind.Dirty && (mods & (Mods.Ctrl | Mods.Alt)) == 0)
+        {
+            if (_word.Length > 0) _word.Length--;
+        }
+        else
+        {
+            _word.Clear();
+        }
+        return key;
+    }
+
+    static string DescribeForLog(HeldKey key) =>
+        key.Kind == KeyKind.Printable ? $"'{key.Char}'" : $"key 0x{key.Data.vkCode:X2}";
+
+    /// <summary>
+    /// Is the window in "menu bar" mode (Alt pressed alone, or after a language switch)? Not when a menu is open
+    /// (e.g. Alt+Space): then keys are meant for that menu.
+    /// </summary>
+    static bool InMenuBarMode(uint threadId)
+    {
+        var gti = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+        if (!GetGUIThreadInfo(threadId, ref gti)) return false;
+        return (gti.flags & (GUI_INMENUMODE | GUI_SYSTEMMENUMODE)) != 0 && (gti.flags & GUI_POPUPMENUMODE) == 0;
+    }
+
+    static INPUT KeyInput(int vk, bool keyUp) => new()
+    {
+        type = INPUT_KEYBOARD,
+        u = new InputUnion
+        {
+            ki = new KEYBDINPUT
+            {
+                wVk = (ushort)vk,
+                wScan = (ushort)MapVirtualKey((uint)vk, 0),
+                dwFlags = keyUp ? KEYEVENTF_KEYUP : 0,
+                dwExtraInfo = OwnInputTag,
+            },
+        },
+    };
 
     /// <summary>Starts a check for <c>_held[0]</c>, the first character after something that may have started a new line.</summary>
     /// <param name="settleMs">Wait before looking (keys were just replayed and Zoom may not have processed them yet).</param>
@@ -352,6 +439,8 @@ internal sealed class KeyboardMonitor : IDisposable
     {
         var first = _held[0];
         _dirty = false;
+        _checkLineStart = _lineStartPending;
+        _lineStartPending = false;
 
         // The user typed a direction mark themselves: leave the line alone.
         if (Bidi.IsDirectionMark(first.Char))
@@ -362,13 +451,13 @@ internal sealed class KeyboardMonitor : IDisposable
 
         _phase = Phase.Checking;
         int id = ++_checkId;
-        bool afterEnter = _afterEnter, mayUseLastChat = !_focusMayHaveMoved;
+        bool mayUseLastChat = !_focusMayHaveMoved;
         _focusMayHaveMoved = false;
         _checkClock.Restart();
         if (_log.Enabled)
-            _log.Info($"'{first.Char}' U+{(int)first.Char:X4}: checking (#{id}){(afterEnter ? ", after Enter" : "")}{(mayUseLastChat ? "" : ", focus may have moved")}");
+            _log.Info($"'{first.Char}' U+{(int)first.Char:X4}: checking (#{id}){(_checkLineStart ? ", new line" : "")}{(mayUseLastChat ? "" : ", focus may have moved")}");
         uint hookThread = _threadId;
-        _inspector.Query(pid, id, afterEnter, mayUseLastChat, settleMs,
+        _inspector.Query(pid, id, mayUseLastChat, settleMs,
             (rid, state) => PostThreadMessage(hookThread, WM_APP_CHECK_RESULT, rid, (int)state));
         uint timeout = _settings.UiaTimeoutMs > 0 ? (uint)_settings.UiaTimeoutMs : CheckTimeoutMsDefault;
         StartTimer(ref _timer, timeout + (uint)settleMs);
@@ -380,7 +469,8 @@ internal sealed class KeyboardMonitor : IDisposable
     {
         if (_phase != Phase.Checking || id != _checkId) return; // stale (already timed out)
         StopTimer(ref _timer);
-        bool insert = state == CaretState.LineStart;
+        // A line starts where we saw Enter/Ctrl+A just before, or in an empty chat box.
+        bool insert = state == CaretState.ChatEmpty || state == CaretState.ChatNotEmpty && _checkLineStart;
 
         // Keys after the first caret-moving key (Enter, Backspace, click...) belong to what comes next:
         // they are examined again once this part has been replayed.
@@ -556,19 +646,21 @@ internal sealed class KeyboardMonitor : IDisposable
     /// <summary>Decides what a key event means, given the modifier state in effect for it.</summary>
     HeldKey Describe(KBDLLHOOKSTRUCT k, bool down, uint threadId, Mods mods)
     {
-        if (!down || IsModifier(k.vkCode)) return new HeldKey(k, !down, KeyKind.Neutral, '\0', false, false);
+        if (!down || IsModifier(k.vkCode)) return new HeldKey(k, !down, KeyKind.Neutral, '\0', false, false, false);
 
-        bool isEnter = k.vkCode == VK_RETURN;
-        bool focusMove = k.vkCode is VK_TAB or VK_F6 || (mods & (Mods.Alt | Mods.Win)) != 0 && (mods & Mods.Ctrl) == 0;
         bool ctrl = (mods & Mods.Ctrl) != 0, alt = (mods & Mods.Alt) != 0, win = (mods & Mods.Win) != 0;
+        // Enter, Shift+Enter (new line) and Ctrl+Enter (send) all leave the caret at the start of a line.
+        bool newLine = k.vkCode == VK_RETURN && !alt && !win;
+        bool selectAll = k.vkCode == VK_A && ctrl && !alt && !win;
+        bool focusMove = k.vkCode is VK_TAB or VK_F6 || (mods & (Mods.Alt | Mods.Win)) != 0 && (mods & Mods.Ctrl) == 0;
         bool altGr = ctrl && alt;
         if (win || ctrl != alt) // shortcut (Ctrl+V, Ctrl+Z, Ctrl+Enter, Alt+Tab, ...)
-            return new HeldKey(k, false, KeyKind.Dirty, '\0', isEnter, focusMove);
+            return new HeldKey(k, false, KeyKind.Dirty, '\0', newLine, selectAll, focusMove);
 
         char? ch = Translate(k, threadId, (mods & Mods.Shift) != 0, altGr);
         if (ch is null) // Enter, Backspace, Delete, arrows, Home/End, Tab, Esc, ...
-            return new HeldKey(k, false, KeyKind.Dirty, '\0', isEnter, focusMove);
-        return new HeldKey(k, false, KeyKind.Printable, ch.Value, false, false);
+            return new HeldKey(k, false, KeyKind.Dirty, '\0', newLine, false, focusMove);
+        return new HeldKey(k, false, KeyKind.Printable, ch.Value, false, false, false);
     }
 
     static Mods PhysicalMods()
