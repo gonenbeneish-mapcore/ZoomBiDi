@@ -130,7 +130,7 @@ function Type-Text([string]$s) {
 function Clear-Box { Assert-Fg; [H]::CtrlA(); Start-Sleep -Milliseconds 80; Assert-Fg; [H]::Vk(0x2E); Start-Sleep -Milliseconds 300 }
 
 # Each expected line is "<alignment>|<text>" as the test page reports it (always L: ZoomBiDi doesn't align lines).
-# ^ marks where U+2067 should be inserted: at the start of every line.
+# ^ marks where U+2068 should be inserted: at the start of every line.
 # `n = Enter, `b = Backspace, ← = Left arrow, ⇤ = Home.
 $cases = @(
   @{ name = 'hebrew only';                type = 'שלום לכולם';                        expect = 'L|^שלום לכולם' }
@@ -169,8 +169,8 @@ try {
     else { Type-Text $c.type }
     Start-Sleep -Milliseconds 400
     $got = ([H]::FgTitle() -replace '^ZTDF-TEST\|', '')
-    $want = $c.expect.Replace('^', [string][char]0x2067).Replace("`n", '⏎')
-    $show = { param($s) [regex]::Replace($s, "\u2067", "^") }
+    $want = $c.expect.Replace('^', [string][char]0x2068).Replace("`n", '⏎')
+    $show = { param($s) [regex]::Replace($s, "\u2068", "^") }
     if ([string]::Equals($got, $want, [StringComparison]::Ordinal)) { "PASS  {0,-27} {1}" -f $c.name, (& $show $got) }
     else { $fail++; "FAIL  {0,-27} got:  {1}`n      {2,-27} want: {3}" -f $c.name, (& $show $got), '', (& $show $want) }
   }

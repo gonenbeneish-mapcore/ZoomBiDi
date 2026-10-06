@@ -10,8 +10,15 @@ internal sealed class Settings
 {
     public bool Enabled { get; set; } = true;
 
-    /// <summary>Hex code point of the character to insert. 2067 = RIGHT-TO-LEFT ISOLATE.</summary>
-    public string MarkerHex { get; set; } = "2067";
+    /// <summary>
+    /// Hex code point of the character to insert. 2068 = FIRST STRONG ISOLATE: the line takes the direction of
+    /// its first letter, so Hebrew lines read right-to-left and English lines stay left-to-right.
+    /// (Up to 1.2 the default was 2067, RIGHT-TO-LEFT ISOLATE, which also reversed English-first lines.)
+    /// </summary>
+    public string MarkerHex { get; set; } = "2068";
+
+    /// <summary>The default before 1.3; a settings file still holding it is upgraded (write "U+2067" to keep it).</summary>
+    const string OldDefaultMarkerHex = "2067";
 
     /// <summary>Process names (without .exe) that are treated as Zoom.</summary>
     public string[] ProcessNames { get; set; } = ["Zoom"];
@@ -35,7 +42,7 @@ internal sealed class Settings
         int.TryParse(MarkerHex.Trim().Replace("U+", "", StringComparison.OrdinalIgnoreCase),
             NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var cp) && cp is > 0 and <= 0xFFFF
             ? (char)cp
-            : (char)0x2067; // RIGHT-TO-LEFT ISOLATE
+            : (char)0x2068; // FIRST STRONG ISOLATE
 
     public static string DefaultDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ZoomBiDi");
@@ -64,7 +71,15 @@ internal sealed class Settings
             s = new Settings();
         }
         s.FilePath = path;
-        if (!File.Exists(path)) s.Save();
+        if (!File.Exists(path))
+        {
+            s.Save();
+        }
+        else if (string.Equals(s.MarkerHex?.Trim(), OldDefaultMarkerHex, StringComparison.Ordinal))
+        {
+            s.MarkerHex = new Settings().MarkerHex; // old default: move to the new one
+            s.Save();
+        }
         return s;
     }
 

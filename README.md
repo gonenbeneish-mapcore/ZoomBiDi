@@ -19,12 +19,13 @@ Words come out in the wrong order and the cursor jumps around while you type:
 
 <p align="center"><img src="assets/before-after.png" width="640" alt="Before: Hebrew and English words out of order in Zoom chat. After: the line reads right-to-left correctly."></p>
 
-The known workaround is to type an invisible Unicode character, U+2067 (RIGHT-TO-LEFT ISOLATE), at the start of
-every line, which tells Zoom the line is right-to-left. ZoomBiDi does that for you automatically:
+The known workaround is to type an invisible Unicode character at the start of every line to tell Zoom which
+way the line goes. ZoomBiDi does that for you automatically:
 
 * It runs quietly in the system tray.
-* Every time you start a new line in a Zoom chat box, it slips the invisible character in at the start of the
-  line.
+* Every time you start a new line in a Zoom chat box, it slips U+2068 (FIRST STRONG ISOLATE) in at the start of
+  the line. That character gives the line the direction of its first letter: lines that start in Hebrew read
+  right-to-left, and lines that start in English stay left-to-right (`hello שלום` stays `hello שלום`).
 * Search boxes and other fields in Zoom aren't touched. Outside Zoom it does nothing at all.
 * It's light: about 3 MB of memory while you're in other apps, about 12–17 MB while Zoom is in front, and no
   CPU at all outside Zoom. The first character of a line is held for a few milliseconds (median 6 ms); the rest
@@ -84,7 +85,7 @@ by default) records only the first character of each new line and the short bit 
     that starts at the line start counts as the start of the line (typing replaces it, mark included). If the
     caret is right before the line's existing mark (Home on a line that's already fixed), it's moved past the
     mark instead, so the mark stays first.
-* **Replay in order.** The held keys are then replayed with `SendInput`, with U+2067 in front when needed.
+* **Replay in order.** The held keys are then replayed with `SendInput`, with U+2068 in front when needed.
   A typical check takes 3–10 ms (median 6 ms).
 * **Keys typed during a check.** They're held too, and each is classified as it arrives, using the modifier
   state the held keys themselves produce (so a held Ctrl+V is still seen as a shortcut). If they include a new
@@ -116,7 +117,7 @@ the Explorer address bar. Restart ZoomBiDi after editing.
 | Setting | Default | Meaning |
 |---|---|---|
 | `Enabled` | `true` | Same as the tray toggle |
-| `MarkerHex` | `2067` | Code point to insert (e.g. `200F` for RLM) |
+| `MarkerHex` | `2068` | Code point to insert. `2068` (FSI) follows each line's first letter. Up to 1.2 the default was `2067` (RLI, always right-to-left); settings files still holding `2067` are upgraded automatically, so write `U+2067` to keep it on purpose |
 | `ProcessNames` | `["Zoom"]` | Processes (without `.exe`) treated as Zoom |
 | `ChatNamePattern` | `message` | Regex matched (case-insensitive) against the focused box's accessible name |
 | `UiaTimeoutMs` | `250` | Give up and type without the mark if the check takes longer |
@@ -153,7 +154,7 @@ For the standalone build, use `-p:SelfContained=true -p:EnableCompressionInSingl
 
 `test/testpage.html` is a Chromium contenteditable box labelled like Zoom's chat input. `test/TypeHarness.ps1`
 types 23 cases into it (Hebrew, English and mixed lines, multiple lines, Backspace, Home, arrows, selections,
-and "bursts" sent in one go so that keys arrive while a check is running) and checks exactly where U+2067
+and "bursts" sent in one go so that keys arrive while a check is running) and checks exactly where U+2068
 ended up, using an exact comparison (culture-aware string comparison ignores invisible characters).
 
 | Option | Effect |
@@ -179,8 +180,6 @@ anywhere else. The Hebrew and English (US) keyboard layouts must both be install
 
 ### Known limitations
 
-* Lines that start in English get the mark too, which makes Zoom show them right-to-left: `hello שלום`
-  appears as `שלום hello`. Such lines display correctly without the mark.
 * Only typed text is handled. Pasted text doesn't get the marker.
 * The caret sits at the right of a Hebrew line instead of after the last word. That's Zoom's own behaviour (it
   happens without ZoomBiDi too): Zoom's editor has no right-to-left support, and no invisible character changes
