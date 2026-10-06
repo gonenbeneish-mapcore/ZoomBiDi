@@ -129,33 +129,33 @@ function Type-Text([string]$s) {
 }
 function Clear-Box { Assert-Fg; [H]::CtrlA(); Start-Sleep -Milliseconds 80; Assert-Fg; [H]::Vk(0x2E); Start-Sleep -Milliseconds 300 }
 
-# Each expected line is "<alignment>|<text>": R = right-aligned, L = left-aligned (Ctrl+Shift+R / Ctrl+Shift+L,
-# chosen by the line's first letter). ^ marks where U+2067 should be inserted: at the start of every line.
+# Each expected line is "<alignment>|<text>" as the test page reports it (always L: ZoomBiDi doesn't align lines).
+# ^ marks where U+2067 should be inserted: at the start of every line.
 # `n = Enter, `b = Backspace, ← = Left arrow, ⇤ = Home.
 $cases = @(
-  @{ name = 'hebrew only';                type = 'שלום לכולם';                        expect = 'R|^שלום לכולם' }
-  @{ name = 'hebrew then english';        type = 'שלום world';                         expect = 'R|^שלום world' }
+  @{ name = 'hebrew only';                type = 'שלום לכולם';                        expect = 'L|^שלום לכולם' }
+  @{ name = 'hebrew then english';        type = 'שלום world';                         expect = 'L|^שלום world' }
   @{ name = 'english then hebrew';        type = 'hello שלום';                         expect = 'L|^hello שלום' }
-  @{ name = 'mixed sentence';             type = 'אני משתמש ב-Zoom כל יום';            expect = 'R|^אני משתמש ב-Zoom כל יום' }
-  @{ name = 'mixed with punctuation';     type = 'שלום Zoom, מה נשמע? test 123';      expect = 'R|^שלום Zoom, מה נשמע? test 123' }
+  @{ name = 'mixed sentence';             type = 'אני משתמש ב-Zoom כל יום';            expect = 'L|^אני משתמש ב-Zoom כל יום' }
+  @{ name = 'mixed with punctuation';     type = 'שלום Zoom, מה נשמע? test 123';      expect = 'L|^שלום Zoom, מה נשמע? test 123' }
   @{ name = 'english sentence';           type = 'see you at 10, thanks';              expect = 'L|^see you at 10, thanks' }
-  @{ name = 'multi line';                 type = "abc`nשלום`ndef`nעוד שורה";           expect = "L|^abc`nR|^שלום`nL|^def`nR|^עוד שורה" }
-  @{ name = 'multi line mixed';           type = "meeting at 10 בבוקר`nהפגישה ב-10 AM"; expect = "L|^meeting at 10 בבוקר`nR|^הפגישה ב-10 AM" }
-  @{ name = 'digits first';               type = '12 - שלום';                          expect = 'R|^12 - שלום' }
-  @{ name = 'space first';                type = ' שלום';                              expect = 'R|^ שלום' }
-  @{ name = 'backspace: only one marker'; type = "ש`bאבג";                             expect = 'R|^אבג' }
-  @{ name = 'english erased, hebrew';     type = "ab`b`bשלום";                         expect = 'R|^שלום' }
+  @{ name = 'multi line';                 type = "abc`nשלום`ndef`nעוד שורה";           expect = "L|^abc`nL|^שלום`nL|^def`nL|^עוד שורה" }
+  @{ name = 'multi line mixed';           type = "meeting at 10 בבוקר`nהפגישה ב-10 AM"; expect = "L|^meeting at 10 בבוקר`nL|^הפגישה ב-10 AM" }
+  @{ name = 'digits first';               type = '12 - שלום';                          expect = 'L|^12 - שלום' }
+  @{ name = 'space first';                type = ' שלום';                              expect = 'L|^ שלום' }
+  @{ name = 'backspace: only one marker'; type = "ש`bאבג";                             expect = 'L|^אבג' }
+  @{ name = 'english erased, hebrew';     type = "ab`b`bשלום";                         expect = 'L|^שלום' }
   @{ name = 'edit mid-line: no marker';   type = "abc←←X";                             expect = 'L|^aXbc' }
   @{ name = 'home on a fixed line';       type = "abc⇤X";                              expect = 'L|^Xabc' }
-  @{ name = 'home then hebrew';           type = "world⇤שלום ";                        expect = 'R|^שלום world' }
-  @{ name = 'capital after hebrew line';  type = "שלום`nHello there";                  expect = "R|^שלום`nL|^Hello there" }
-  @{ name = 'digits, english after heb.'; type = "שלום`n10 am";                        expect = "R|^שלום`nL|^10 am" }
+  @{ name = 'home then hebrew';           type = "world⇤שלום ";                        expect = 'L|^שלום world' }
+  @{ name = 'capital after hebrew line';  type = "שלום`nHello there";                  expect = "L|^שלום`nL|^Hello there" }
+  @{ name = 'digits, english after heb.'; type = "שלום`n10 am";                        expect = "L|^שלום`nL|^10 am" }
   @{ name = 'select line, retype';        type = "abc⇱X";                              expect = 'L|^X' }
-  @{ name = 'select all, retype hebrew';  type = "abcⒶש";                              expect = 'R|^ש' }
-  @{ name = 'burst: line + next line';    burst = "a`nשלום";                            expect = "L|^a`nR|^שלום" }
-  @{ name = 'burst: digits then hebrew';  burst = '12 - שלום';                           expect = 'R|^12 - שלום' }
+  @{ name = 'select all, retype hebrew';  type = "abcⒶש";                              expect = 'L|^ש' }
+  @{ name = 'burst: line + next line';    burst = "a`nשלום";                            expect = "L|^a`nL|^שלום" }
+  @{ name = 'burst: digits then hebrew';  burst = '12 - שלום';                           expect = 'L|^12 - שלום' }
   @{ name = 'burst: capital next line';   burst = "x`nHello";                           expect = "L|^x`nL|^Hello" }
-  @{ name = 'burst: three lines';         burst = "שלום`nhi`nעוד";                       expect = "R|^שלום`nL|^hi`nR|^עוד" }
+  @{ name = 'burst: three lines';         burst = "שלום`nhi`nעוד";                       expect = "L|^שלום`nL|^hi`nL|^עוד" }
 )
 if ($Only) { $cases = @($Only | ForEach-Object { $cases[$_] }) }
 if (-not [H]::Activate('ZTDF-TEST')) { throw 'test page window not found' }

@@ -10,7 +10,7 @@ namespace ZoomBiDi;
 /// <summary>
 /// Watches typing in Zoom. On the first character typed on a line, the keystroke is held back while UI Automation
 /// checks whether the caret really is at the start of a line in a chat box; then the held keys are replayed,
-/// preceded by the marker character (and Zoom's alignment shortcut) when needed.
+/// preceded by the marker character when needed.
 ///
 /// Cost outside Zoom is zero: a cheap foreground-change notification (WinEvent) is all that runs; the low-level
 /// keyboard/mouse hooks are only installed while a Zoom window is in the foreground.
@@ -21,7 +21,7 @@ namespace ZoomBiDi;
 /// held/replayed keystrokes in their original order.
 ///
 /// Keys typed while a check is running are held too, and examined as they arrive (with the modifier state the
-/// held keys themselves produce), so a fast Enter + next line, or the first letter after "12 - ", is still handled.
+/// held keys themselves produce), so a fast Enter + next line is still handled.
 /// </summary>
 internal sealed class KeyboardMonitor : IDisposable
 {
@@ -52,8 +52,6 @@ internal sealed class KeyboardMonitor : IDisposable
         /// <summary>Replay sent; keys are still held until the replay has passed the hook (keeps order).</summary>
         Draining,
     }
-
-    enum Align { None, Left, Right }
 
     /// <summary>What a key-down means for us, decided when it arrives.</summary>
     enum KeyKind
@@ -98,11 +96,8 @@ internal sealed class KeyboardMonitor : IDisposable
     bool _zoomInForeground;
     Phase _phase = Phase.Normal;
     int _checkId;
-    uint _checkPid;
     /// <summary>Modifier state as the held keys leave it (physical state at the start of holding + held events).</summary>
     Mods _heldMods;
-    /// <summary>This line's mark went in on a non-letter (digit, space…): its first letter will set the alignment.</summary>
-    bool _alignPending;
     UIntPtr _timer, _trimTimer;
     readonly Stopwatch _checkClock = new();
 
@@ -177,7 +172,7 @@ internal sealed class KeyboardMonitor : IDisposable
         }
 
         // Exiting: never swallow what the user typed.
-        if (_held.Count > 0) Send(BuildInputs(false, Align.None, -1, _held.ToArray(), endTag: false));
+        if (_held.Count > 0) Send(BuildInputs(false, _held.ToArray(), endTag: false));
         _held.Clear();
         StopTimer(ref _timer);
         StopTimer(ref _trimTimer);
@@ -206,7 +201,7 @@ internal sealed class KeyboardMonitor : IDisposable
         var rest = _held.ToArray();
         _held.Clear();
         _phase = Phase.Normal;
-        if (rest.Length > 0) Send(BuildInputs(false, Align.None, -1, rest, endTag: false));
+        if (rest.Length > 0) Send(BuildInputs(false, rest, endTag: false));
         ApplyHooks();
     }
 
@@ -245,7 +240,6 @@ internal sealed class KeyboardMonitor : IDisposable
         else if (!want && _keyboardHook != IntPtr.Zero && _phase == Phase.Normal)
         {
             RemoveInputHooks();
-            _alignPending = false;
             _log.Info("Zoom not in front: input hooks off");
             // Give memory back while idle (after a short delay, so quick Alt+Tabs don't churn).
             StopTimer(ref _trimTimer);
@@ -277,7 +271,6 @@ internal sealed class KeyboardMonitor : IDisposable
             {
                 _dirty = true; // a click may have moved the caret or switched chats
                 _focusMayHaveMoved = true;
-                _alignPending = false;
             }
         }
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -337,24 +330,8 @@ internal sealed class KeyboardMonitor : IDisposable
                 return false;
         }
 
-        // Printable.
-        if (!_dirty)
-        {
-            // Same line as the last check, whose mark went in on a digit/space/punctuation: the first letter
-            // decides the line's alignment. No UI Automation needed - just put the shortcut before the letter.
-            if (_alignPending && Bidi.IsLetterOrObject(key.Char))
-            {
-                _alignPending = false;
-                var align = AlignFor(key.Char);
-                if (align == Align.None) return false;
-                if (_log.Enabled) _log.Info($"'{key.Char}' U+{(int)key.Char:X4}: first letter of the line, aligning {align}");
-                _held.Add(key);
-                _heldMods = PhysicalMods();
-                Replay(insertMarker: false, align, alignAt: 0, keepFrom: _held.Count);
-                return true;
-            }
-            return false;
-        }
+        // Printable: only the first character after something that may have started a new line is checked.
+        if (!_dirty) return false;
 
         _held.Add(key);
         _heldMods = PhysicalMods();
@@ -367,7 +344,6 @@ internal sealed class KeyboardMonitor : IDisposable
         _dirty = true;
         _afterEnter = key.IsEnter;
         if (key.FocusMove) _focusMayHaveMoved = true;
-        _alignPending = false;
     }
 
     /// <summary>Starts a check for <c>_held[0]</c>, the first character after something that may have started a new line.</summary>
@@ -376,17 +352,15 @@ internal sealed class KeyboardMonitor : IDisposable
     {
         var first = _held[0];
         _dirty = false;
-        _alignPending = false;
 
         // The user typed a direction mark themselves: leave the line alone.
         if (Bidi.IsDirectionMark(first.Char))
         {
-            Replay(insertMarker: false, Align.None, alignAt: -1, keepFrom: _held.Count);
+            Replay(insertMarker: false, keepFrom: _held.Count);
             return;
         }
 
         _phase = Phase.Checking;
-        _checkPid = pid;
         int id = ++_checkId;
         bool afterEnter = _afterEnter, mayUseLastChat = !_focusMayHaveMoved;
         _focusMayHaveMoved = false;
@@ -412,24 +386,10 @@ internal sealed class KeyboardMonitor : IDisposable
         // they are examined again once this part has been replayed.
         int keepFrom = FirstAfterDirty(start: 1);
 
-        // A line with no letters yet: align it by its first letter - if it was already typed (held), put the
-        // shortcut right before it; otherwise wait for it.
-        var align = Align.None;
-        int alignAt = -1;
-        if (state is CaretState.LineStart or CaretState.MidLineNoLetters && _settings.AlignLines)
-        {
-            int lineEnd = FirstDirty(1, keepFrom); // the line's own keys end at the first caret-moving key
-            alignAt = FirstLetter(0, lineEnd);
-            if (alignAt >= 0) align = AlignFor(_held[alignAt].Char);
-            else _alignPending = lineEnd >= keepFrom; // still on this line: wait for its first letter
-        }
-        if (align == Align.None) alignAt = -1;
-
         if (_log.Enabled)
             _log.Info($"check #{id} -> {state} after {_checkClock.ElapsedMilliseconds} ms, {(insert ? "inserting marker" : "no marker")}" +
-                $"{(align != Align.None ? $", aligning {align}" : _alignPending ? ", alignment waits for the first letter" : "")}" +
                 $", replaying {keepFrom} key event(s){(keepFrom < _held.Count ? $", {_held.Count - keepFrom} more to examine" : "")}");
-        Replay(insert, align, alignAt, keepFrom);
+        Replay(insert, keepFrom);
     }
 
     /// <summary>Index of the first printable key-down that follows a caret-moving key, at or after <paramref name="start"/>.</summary>
@@ -445,28 +405,6 @@ internal sealed class KeyboardMonitor : IDisposable
         return _held.Count;
     }
 
-    /// <summary>Index of the first caret-moving key-down in [from, to), or <paramref name="to"/>.</summary>
-    int FirstDirty(int from, int to)
-    {
-        for (int i = from; i < to; i++)
-            if (_held[i].Kind == KeyKind.Dirty) return i;
-        return to;
-    }
-
-    /// <summary>Index of the first letter key-down in [from, to), or -1.</summary>
-    int FirstLetter(int from, int to)
-    {
-        for (int i = from; i < to; i++)
-            if (_held[i].Kind == KeyKind.Printable && Bidi.IsLetterOrObject(_held[i].Char)) return i;
-        return -1;
-    }
-
-    Align AlignFor(char c)
-    {
-        if (!_settings.AlignLines || !char.IsLetter(c)) return Align.None;
-        return Bidi.IsRtlLetter(c) ? Align.Right : Align.Left;
-    }
-
     void OnTimer(UIntPtr timerId)
     {
         if (timerId == _trimTimer)
@@ -480,7 +418,7 @@ internal sealed class KeyboardMonitor : IDisposable
         if (_phase == Phase.Checking)
         {
             _log.Info($"check #{_checkId} timed out after {_checkClock.ElapsedMilliseconds} ms, replaying held keys without marker");
-            Replay(insertMarker: false, Align.None, alignAt: -1, keepFrom: FirstAfterDirty(start: 1));
+            Replay(insertMarker: false, keepFrom: FirstAfterDirty(start: 1));
         }
         else if (_phase == Phase.Draining)
         {
@@ -512,34 +450,23 @@ internal sealed class KeyboardMonitor : IDisposable
             var h = backlog[i];
             if (h.Up || h.Kind == KeyKind.Neutral) continue;
             if (h.Kind == KeyKind.Dirty) { MarkDirty(h); continue; }
-            if (_dirty && _zoomInForeground && _enabled) break;                                  // starts a new check
-            if (!_dirty && _alignPending && Bidi.IsLetterOrObject(h.Char)) break;              // first letter of a pending line
+            if (_dirty && _zoomInForeground && _enabled) break; // first character after a caret-moving key
         }
 
         if (i == backlog.Length)
         {
             _held.AddRange(backlog);
-            Replay(insertMarker: false, Align.None, alignAt: -1, keepFrom: _held.Count);
+            Replay(insertMarker: false, keepFrom: _held.Count);
             return;
         }
 
-        // Send what comes before (unchanged), then handle backlog[i] like a fresh key, holding the rest.
+        // Send what comes before (unchanged), then check backlog[i] like a fresh key, holding the rest.
         _held.AddRange(backlog[..i]);
         var rest = backlog[i..];
-        if (!_dirty)
-        {
-            // first letter of a line waiting for its alignment
-            _alignPending = false;
-            var align = AlignFor(rest[0].Char);
-            _held.AddRange(rest);
-            Replay(insertMarker: false, align, alignAt: align == Align.None ? -1 : i, keepFrom: FirstAfterDirty(i + 1));
-            return;
-        }
-
         if (i > 0)
         {
             // Unchanged keys first; the new check starts once they've passed (order is kept by Draining).
-            Replay(insertMarker: false, Align.None, alignAt: -1, keepFrom: i, extra: rest);
+            Replay(insertMarker: false, keepFrom: i, extra: rest);
             return;
         }
         _held.AddRange(rest);
@@ -548,10 +475,10 @@ internal sealed class KeyboardMonitor : IDisposable
     }
 
     /// <summary>
-    /// Sends _held[0..keepFrom) (with the marker in front and the alignment shortcut before index
-    /// <paramref name="alignAt"/>, if asked) and keeps _held[keepFrom..] (plus <paramref name="extra"/>) held.
+    /// Sends _held[0..keepFrom) (with the marker in front, if asked) and keeps _held[keepFrom..]
+    /// (plus <paramref name="extra"/>) held.
     /// </summary>
-    void Replay(bool insertMarker, Align align, int alignAt, int keepFrom, HeldKey[]? extra = null)
+    void Replay(bool insertMarker, int keepFrom, HeldKey[]? extra = null)
     {
         keepFrom = Math.Clamp(keepFrom, 0, _held.Count);
         var send = _held.GetRange(0, keepFrom).ToArray();
@@ -565,7 +492,7 @@ internal sealed class KeyboardMonitor : IDisposable
         foreach (var h in send)
             if (h.Kind == KeyKind.Dirty) MarkDirty(h);
 
-        var inputs = BuildInputs(insertMarker, align, alignAt, send, endTag: true);
+        var inputs = BuildInputs(insertMarker, send, endTag: true);
         _phase = Phase.Draining;
         if (inputs.Length > 0 && Send(inputs))
         {
@@ -579,26 +506,16 @@ internal sealed class KeyboardMonitor : IDisposable
         }
     }
 
-    INPUT[] BuildInputs(bool insertMarker, Align align, int alignAt, HeldKey[] keys, bool endTag)
+    INPUT[] BuildInputs(bool insertMarker, HeldKey[] keys, bool endTag)
     {
-        var list = new List<INPUT>(keys.Length + 8);
+        var list = new List<INPUT>(keys.Length + 2);
         if (insertMarker)
         {
             var marker = _settings.MarkerChar;
             list.Add(UnicodeKey(marker, keyUp: false));
             list.Add(UnicodeKey(marker, keyUp: true));
         }
-
-        // Modifiers as they'll be when the shortcut is replayed: what Windows has seen (held keys aren't in the
-        // async key state yet), plus the held keys replayed before it.
-        var mods = PhysicalMods();
-        for (int i = 0; i < keys.Length; i++)
-        {
-            if (i == alignAt) AddAlignShortcut(list, align, mods);
-            list.Add(ReplayKey(keys[i]));
-            UpdateMods(ref mods, keys[i].Data.vkCode, !keys[i].Up);
-        }
-        if (alignAt >= keys.Length) AddAlignShortcut(list, align, mods);
+        foreach (var key in keys) list.Add(ReplayKey(key));
 
         if (endTag && list.Count > 0)
         {
@@ -728,47 +645,6 @@ internal sealed class KeyboardMonitor : IDisposable
         if (n >= 1 && _charBuffer[0] >= 0x20 && _charBuffer[0] != 0x7F) return _charBuffer[0];
         return null;
     }
-
-    /// <summary>
-    /// Zoom's alignment shortcut: Ctrl+Shift+R (right) or Ctrl+Shift+L (left). Real scan codes are required -
-    /// Zoom's web editor recognises the shortcut by physical key code. Ctrl/Shift that will already be down
-    /// (e.g. Shift for a capital first letter) are not pressed or released, so the replayed letter keeps them.
-    /// Skipped while Alt or Win is down (AltGr letters, Alt+Shift language switch): the shortcut would change meaning.
-    /// </summary>
-    void AddAlignShortcut(List<INPUT> list, Align align, Mods mods)
-    {
-        if (align == Align.None) return;
-        if ((mods & (Mods.Alt | Mods.Win)) != 0)
-        {
-            _log.Info($"not aligning {align}: Alt/Win is held");
-            return;
-        }
-        const ushort ScanCtrl = 0x1D, ScanShift = 0x2A, ScanR = 0x13, ScanL = 0x26;
-        ushort vk = align == Align.Right ? (ushort)0x52 : (ushort)0x4C;
-        ushort scan = align == Align.Right ? ScanR : ScanL;
-        bool ctrlHeld = (mods & Mods.Ctrl) != 0, shiftHeld = (mods & Mods.Shift) != 0;
-        if (!ctrlHeld) list.Add(ScanKey(VK_CONTROL, ScanCtrl, keyUp: false));
-        if (!shiftHeld) list.Add(ScanKey(VK_SHIFT, ScanShift, keyUp: false));
-        list.Add(ScanKey(vk, scan, keyUp: false));
-        list.Add(ScanKey(vk, scan, keyUp: true));
-        if (!shiftHeld) list.Add(ScanKey(VK_SHIFT, ScanShift, keyUp: true));
-        if (!ctrlHeld) list.Add(ScanKey(VK_CONTROL, ScanCtrl, keyUp: true));
-    }
-
-    static INPUT ScanKey(int vk, ushort scan, bool keyUp) => new()
-    {
-        type = INPUT_KEYBOARD,
-        u = new InputUnion
-        {
-            ki = new KEYBDINPUT
-            {
-                wVk = (ushort)vk,
-                wScan = scan,
-                dwFlags = keyUp ? KEYEVENTF_KEYUP : 0,
-                dwExtraInfo = OwnInputTag,
-            },
-        },
-    };
 
     static INPUT ReplayKey(HeldKey key)
     {

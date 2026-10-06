@@ -10,13 +10,6 @@ internal sealed class Settings
 {
     public bool Enabled { get; set; } = true;
 
-    /// <summary>
-    /// Also align each line by its first letter: Ctrl+Shift+R (right) for Hebrew/Arabic, Ctrl+Shift+L (left) for
-    /// other letters. These are Zoom's own alignment shortcuts; a new line inherits the previous line's alignment,
-    /// so every line gets one.
-    /// </summary>
-    public bool AlignLines { get; set; } = true;
-
     /// <summary>Hex code point of the character to insert. 2067 = RIGHT-TO-LEFT ISOLATE.</summary>
     public string MarkerHex { get; set; } = "2067";
 

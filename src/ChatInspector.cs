@@ -13,8 +13,8 @@ internal enum CaretState
     /// <summary>Focused element is a chat box and nothing precedes the caret on its line.</summary>
     LineStart,
     /// <summary>
-    /// Focused element is a chat box; the line already has its mark, but no letters before the caret yet
-    /// (e.g. after Backspace, or Home on a fixed line). The next letter decides the line's alignment.
+    /// Focused element is a chat box; the line already has content before the caret (e.g. its mark), but no
+    /// letters yet - e.g. after Backspace, or Home on a fixed line (the caret is then moved past the mark).
     /// </summary>
     MidLineNoLetters,
     /// <summary>Focused element is a chat box, and the line already has letters before the caret.</summary>
