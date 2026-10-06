@@ -204,6 +204,7 @@ internal sealed class KeyboardMonitor : IDisposable
                         {
                             _enabled = msg.wParam != IntPtr.Zero;
                             _dirty = true;
+                            FocusMayHaveMoved(); // anything may have been typed while paused
                             ApplyHooks();
                         });
                         continue;
@@ -431,6 +432,7 @@ internal sealed class KeyboardMonitor : IDisposable
     /// <summary>A character went into the box (passed through or replayed).</summary>
     void Typed()
     {
+        _lastWasSelectAll = false; // Ctrl+A, then typing: the selection is gone, a later Backspace is just a Backspace
         if (_markOnLine) _charsAfterMark++;
         if (_currentChatKey is not null && _typedChats.Count < 1000) _typedChats.Add(_currentChatKey);
     }
@@ -505,9 +507,10 @@ internal sealed class KeyboardMonitor : IDisposable
             return key;
         }
 
-        // Caret-moving key.
-        if (key.NewLine && _word.Length > 0 && _word[0] is '@' or ':')
-            key = key with { NewLine = false }; // Enter picks from Zoom's mention/emoji list
+        // Caret-moving key. Zoom's mention list opens on "@", its emoji list on ":" followed by letters (":smi");
+        // Enter then picks from the list instead of starting a line (but ":)" is just a smiley).
+        bool picking = _word.Length > 0 && (_word[0] == '@' || _word[0] == ':' && _word.Length > 1 && char.IsLetter(_word[1]));
+        if (key.NewLine && picking) key = key with { NewLine = false };
         if (k.vkCode == VK_BACK && key.Kind == KeyKind.Dirty && (mods & (Mods.Ctrl | Mods.Alt)) == 0)
         {
             if (_word.Length > 0) _word.Length--;
@@ -586,9 +589,9 @@ internal sealed class KeyboardMonitor : IDisposable
 
     void OnCheckResult(int id, CaretState state)
     {
+        var chatKey = _inspector.TakeChatKey(id); // collect it even for a stale result, so nothing piles up
         if (_phase != Phase.Checking || id != _checkId) return; // stale (already timed out)
         StopTimer(ref _timer);
-        var chatKey = _inspector.TakeChatKey(id);
         bool chat = state is CaretState.ChatEmpty or CaretState.ChatNotEmpty;
         if (chat) _currentChatKey = chatKey;
 

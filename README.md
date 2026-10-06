@@ -75,8 +75,8 @@ Backspace, arrows…).
 * **Line starts come from the keys.** Zoom's message box doesn't expose its caret or text to UI Automation (its
   Text pattern returns only the box's label, "Message to …"), so ZoomBiDi works out where a line starts from
   what it sees typed. A line starts:
-  * after Enter, Shift+Enter or Ctrl+Enter, except when the word just typed starts with `@` or `:` (then Enter
-    picks from Zoom's mention or emoji list);
+  * after Enter, Shift+Enter or Ctrl+Enter, except when the word just typed starts with `@`, or with `:` and a
+    letter (then Enter picks from Zoom's mention or emoji list);
   * after the message is sent (Ctrl+Enter or Enter, whichever Zoom's box label says sends), after Ctrl+A
     (followed by typing, Delete or Backspace), or when Backspace removed the mark of the box's only line;
   * when the user arrives in a chat (click, window switch, Tab, Zoom's chat-switching keys) whose box Zoom
@@ -160,7 +160,7 @@ For the standalone build, use `-p:SelfContained=true -p:EnableCompressionInSingl
 ### Test
 
 `test/testpage.html` is a Chromium contenteditable box labelled like Zoom's chat input. `test/TypeHarness.ps1`
-types 29 cases into it (Hebrew, English and mixed lines, multiple lines, Backspace over the mark, typos fixed
+types 31 cases into it (Hebrew, English and mixed lines, multiple lines, Backspace over the mark, typos fixed
 mid-line, Home, arrows, selections, Enter picking a mention, Alt taps, and "bursts" sent in one go so that keys
 arrive while a check is running) and checks exactly where U+2068 ended up, using an exact comparison
 (culture-aware string comparison ignores invisible characters). Unlike Zoom, the test page exposes its text, so
@@ -199,6 +199,6 @@ anywhere else. The Hebrew and English (US) keyboard layouts must both be install
   goes for returning to a chat whose draft you emptied with Backspace (rather than sending it or Ctrl+A).
 * The chat inside a Zoom *meeting* hasn't been tested and may name its text box differently. If it's ignored
   there, the debug log shows the name, and `ChatNamePattern` can be widened.
-* Enter right after a word starting with `@` or `:` is assumed to pick a mention or emoji, so it doesn't start a
-  marked line, even if no list was open.
+* Enter right after a word starting with `@`, or with `:` and a letter (`:smile`), is assumed to pick a mention
+  or emoji, so it doesn't start a marked line, even if no list was open.
 * A mouse click within a few milliseconds of a line's first character can reach Zoom before that character.

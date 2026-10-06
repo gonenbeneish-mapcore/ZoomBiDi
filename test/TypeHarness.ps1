@@ -159,6 +159,8 @@ $cases = @(
   @{ name = 'backspace joins empty line'; type = "שלום`nab`b`b`bX";                 expect = 'L|^שלוםX' }
   @{ name = 'backspace empties the box';  type = "abc`b`b`b`bX";                   expect = 'L|^X' }
   @{ name = 'typo fixed mid-line';        type = "בדיקה x`bone two three בדיקה";        expect = 'L|^בדיקה one two three בדיקה' }
+  @{ name = 'ctrl+a, retype, fix typo';   type = "abcⒶשלוx`bם";                        expect = 'L|^שלום' }
+  @{ name = 'smiley then enter';          type = "ok :)`nשלום";                        expect = "L|^ok :)`nL|^שלום" }
   @{ name = 'burst: line + next line';    burst = "a`nשלום";                            expect = "L|^a`nL|^שלום" }
   @{ name = 'burst: digits then hebrew';  burst = '12 - שלום';                           expect = 'L|^12 - שלום' }
   @{ name = 'burst: capital next line';   burst = "x`nHello";                           expect = "L|^x`nL|^Hello" }
