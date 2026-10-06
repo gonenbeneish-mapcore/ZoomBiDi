@@ -39,6 +39,13 @@ internal sealed class ChatInspector : IDisposable
     const int TransientRetryDelayMs = 25;
 
     readonly BlockingCollection<Request> _queue = new();
+    /// <summary>Which chat box each finished check was about (request id → key), collected by the hook thread.</summary>
+    readonly ConcurrentDictionary<int, string> _chatKeys = new();
+
+    /// <summary>
+    /// The identity of the chat box a check found ("Message to …" label), or null. Call once per check result.
+    /// </summary>
+    public string? TakeChatKey(int id) => _chatKeys.TryRemove(id, out var key) ? key : null;
     readonly Thread _thread;
     readonly Logger _log;
     readonly Func<Regex> _namePattern;
@@ -78,6 +85,7 @@ internal sealed class ChatInspector : IDisposable
             if (req.SettleMs > 0) Thread.Sleep(req.SettleMs);
             CaretState result;
             string detail;
+            string? chatKey = null;
             int attempt = 0;
             while (true)
             {
@@ -86,7 +94,7 @@ internal sealed class ChatInspector : IDisposable
                 try
                 {
                     _uia ??= (IUIAutomation)new CUIAutomation();
-                    result = Inspect(req.ProcessId, req.MayUseLastChat, com, out detail, out transient);
+                    result = Inspect(req.ProcessId, req.MayUseLastChat, com, out detail, out transient, out chatKey);
                 }
                 catch (Exception ex)
                 {
@@ -105,6 +113,7 @@ internal sealed class ChatInspector : IDisposable
                 Thread.Sleep(TransientRetryDelayMs);
             }
             if (req.Callback is null) continue;
+            if (chatKey is not null) _chatKeys[req.Id] = chatKey;
             if (_log.Enabled)
                 _log.Info($"check #{req.Id}: {result} in {sw.ElapsedMilliseconds} ms ({detail})" +
                     $"{(attempt > 0 ? $" after {attempt} focus retr{(attempt == 1 ? "y" : "ies")}" : "")}");
@@ -122,13 +131,15 @@ internal sealed class ChatInspector : IDisposable
     /// True when focus isn't on any text box at all (menu bar, window, other process) - typically a passing state,
     /// worth asking again. False for a definite answer, including "a text box, but not a chat box".
     /// </param>
-    CaretState Inspect(uint processId, bool mayUseLastChat, List<object> com, out string detail, out bool transient)
+    CaretState Inspect(uint processId, bool mayUseLastChat, List<object> com, out string detail, out bool transient,
+        out string? chatKey)
     {
         transient = true;
+        chatKey = null;
         var el = _uia!.GetFocusedElement();
         if (el is null)
         {
-            if (mayUseLastChat) return FromLastChat(processId, "no focused element", com, out detail, ref transient);
+            if (mayUseLastChat) return FromLastChat(processId, "no focused element", com, out detail, ref transient, out chatKey);
             detail = "no focused element";
             return CaretState.NotChat;
         }
@@ -151,7 +162,7 @@ internal sealed class ChatInspector : IDisposable
             // arrives - which is the very key we're holding. If nothing could have moved focus since the last
             // check (no click, Tab, window switch), ask the chat box from that check directly.
             if (mayUseLastChat && type is Uia.UIA_MenuBarControlTypeId or Uia.UIA_MenuControlTypeId or Uia.UIA_MenuItemControlTypeId)
-                return FromLastChat(processId, why, com, out detail, ref transient);
+                return FromLastChat(processId, why, com, out detail, ref transient, out chatKey);
             detail = why;
             return CaretState.NotChat;
         }
@@ -164,7 +175,7 @@ internal sealed class ChatInspector : IDisposable
         }
 
         RememberChat(el, processId, com);
-        return EvaluateChat(el, name, com, out detail);
+        return EvaluateChat(el, name, com, out detail, out chatKey);
     }
 
     // The chat box from the last successful check (inspector thread only).
@@ -185,12 +196,14 @@ internal sealed class ChatInspector : IDisposable
         _lastChat = null;
     }
 
-    CaretState FromLastChat(uint processId, string why, List<object> com, out string detail, ref bool transient)
+    CaretState FromLastChat(uint processId, string why, List<object> com, out string detail, ref bool transient,
+        out string? chatKey)
     {
+        chatKey = null;
         if (_lastChat is null || _lastChatOwner != processId) { detail = why; return CaretState.NotChat; }
         try
         {
-            var state = EvaluateChat(_lastChat, _lastChat.get_CurrentName() ?? "", com, out var d);
+            var state = EvaluateChat(_lastChat, _lastChat.get_CurrentName() ?? "", com, out var d, out chatKey);
             transient = false;
             detail = $"{why}; used the chat box from the last check: {d}";
             return state;
@@ -203,8 +216,12 @@ internal sealed class ChatInspector : IDisposable
         }
     }
 
-    /// <summary>Is the chat box empty? Works for Zoom's box (label + draft in the name) and for ordinary text boxes.</summary>
-    static CaretState EvaluateChat(IUIAutomationElement el, string name, List<object> com, out string detail)
+    /// <summary>
+    /// Does the chat box look empty? For Zoom's box this comes from the name (label + the draft as it was when the
+    /// chat was opened - it isn't updated while typing), so the hook only trusts it when the user just arrived in
+    /// the chat. <paramref name="chatKey"/> identifies the chat (Zoom's "Message to …" label).
+    /// </summary>
+    static CaretState EvaluateChat(IUIAutomationElement el, string name, List<object> com, out string detail, out string chatKey)
     {
         string? text = null;
         if (el.GetCurrentPattern(Uia.UIA_TextPatternId) is IUIAutomationTextPattern tp)
@@ -225,11 +242,13 @@ internal sealed class ChatInspector : IDisposable
         {
             // Zoom: the "text" is just the label, and the name is the label followed by the draft.
             content = name[label.Length..].Trim().TrimEnd(',').Trim();
+            chatKey = label;
             detail = $"Zoom-style box, draft of {content.Length} char(s)";
         }
         else
         {
             content = text;
+            chatKey = name;
             detail = $"text of {content.Length} char(s)";
         }
 

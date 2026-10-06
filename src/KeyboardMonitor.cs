@@ -8,9 +8,13 @@ using static ZoomBiDi.Native;
 namespace ZoomBiDi;
 
 /// <summary>
-/// Watches typing in Zoom. On the first character typed on a line, the keystroke is held back while UI Automation
-/// checks whether the caret really is at the start of a line in a chat box; then the held keys are replayed,
-/// preceded by the marker character when needed.
+/// Watches typing in Zoom and puts the marker character at the start of each line of a chat message.
+///
+/// Zoom doesn't expose its caret or message text to UI Automation, so where a line starts is worked out from the
+/// keys: after Enter / Shift+Enter / Ctrl+Enter, after Ctrl+A (then typing or deleting), when Backspace removed the
+/// mark of the box's only line, or when the user arrives in a chat whose box is empty (and hasn't typed there since
+/// it was last sent). For those first characters the key is held back while UI Automation confirms the focus is a
+/// chat box; then the held keys are replayed, preceded by the marker. Other keys pass straight through.
 ///
 /// Cost outside Zoom is zero: a cheap foreground-change notification (WinEvent) is all that runs; the low-level
 /// keyboard/mouse hooks are only installed while a Zoom window is in the foreground.
@@ -41,7 +45,8 @@ internal sealed class KeyboardMonitor : IDisposable
     /// them (and updates what UI Automation reports) a little later.
     /// </summary>
     const int BacklogSettleMs = 40;
-    const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75, VK_ESCAPE = 0x1B, VK_A = 0x41;
+    const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75, VK_ESCAPE = 0x1B, VK_A = 0x41, VK_DELETE = 0x2E;
+    const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_UP = 0x26, VK_DOWN = 0x28, VK_L = 0x4C, VK_N = 0x4E, VK_W = 0x57;
     const uint GUI_INMENUMODE = 0x4, GUI_SYSTEMMENUMODE = 0x8, GUI_POPUPMENUMODE = 0x10;
 
     enum Phase
@@ -67,9 +72,13 @@ internal sealed class KeyboardMonitor : IDisposable
 
     /// <param name="NewLine">Enter/Shift+Enter/Ctrl+Enter that starts a new line (or sends the message).</param>
     /// <param name="SelectAll">Ctrl+A: the next character replaces everything.</param>
+    /// <param name="FocusMove">May move focus to another box or chat (click-free): Tab, F6, Alt/Win combos, chat switching.</param>
     /// <param name="PlainBackspace">Backspace without Ctrl/Alt/Win (deletes exactly one character).</param>
+    /// <param name="PlainDelete">Delete without Ctrl/Alt/Win.</param>
+    /// <param name="CtrlEnter">Ctrl+Enter (sends, in Zoom's default setting).</param>
+    /// <param name="PlainEnter">Enter alone (sends, if Zoom is set to "Enter to send").</param>
     readonly record struct HeldKey(KBDLLHOOKSTRUCT Data, bool Up, KeyKind Kind, char Char, bool NewLine, bool SelectAll,
-        bool FocusMove, bool PlainBackspace = false);
+        bool FocusMove, bool PlainBackspace = false, bool PlainDelete = false, bool CtrlEnter = false, bool PlainEnter = false);
 
     [Flags]
     enum Mods { None = 0, Shift = 1, Ctrl = 2, Alt = 4, Win = 8 }
@@ -98,10 +107,23 @@ internal sealed class KeyboardMonitor : IDisposable
     /// character starts a line. Zoom doesn't expose the caret position, so this is tracked from the keys.
     /// </summary>
     bool _lineStartPending;
+    /// <summary>...and the box is empty (message sent, everything selected or deleted).</summary>
+    bool _lineStartEmptyBox;
+    /// <summary>The previous caret-moving key was Ctrl+A (so Backspace/Delete now empties the box).</summary>
+    bool _lastWasSelectAll;
     /// <summary>The word typed so far on this line ("@na" while picking a mention: Enter then picks it, not a new line).</summary>
     readonly System.Text.StringBuilder _word = new();
-    /// <summary>Line start known for the check in progress.</summary>
-    bool _checkLineStart;
+    /// <summary>For the check in progress: line start known from the keys / box known empty / user just arrived.</summary>
+    bool _checkLineStart, _checkEmptyBox, _checkFocusArrival;
+    /// <summary>The chat box the caret is in (from the last check), or null if focus may have moved since.</summary>
+    string? _currentChatKey;
+    /// <summary>
+    /// Chats typed into since their box was last sent or cleared. Zoom's "is the box empty" information is only
+    /// up to date when a chat is opened, so for these chats it isn't trusted.
+    /// </summary>
+    readonly HashSet<string> _typedChats = new();
+    /// <summary>The line with our mark started in an empty box (so deleting the mark empties the box again).</summary>
+    bool _lineFromEmptyBox;
     /// <summary>
     /// We put a mark at the start of this line and, since then, only typing and Backspace happened - so the
     /// caret is exactly <see cref="_charsAfterMark"/> characters after the mark.
@@ -116,7 +138,11 @@ internal sealed class KeyboardMonitor : IDisposable
     int _checkId;
     /// <summary>Modifier state as the held keys leave it (physical state at the start of holding + held events).</summary>
     Mods _heldMods;
-    UIntPtr _timer, _trimTimer;
+    UIntPtr _timer, _trimTimer, _pollTimer;
+    /// <summary>The foreground window as of the last <see cref="UpdateForeground"/> (the poll compares against it).</summary>
+    IntPtr _lastForegroundWnd;
+    /// <summary>Safety net for a missed foreground notification (e.g. a window that came to the front during startup).</summary>
+    const uint ForegroundPollMs = 1000;
     readonly Stopwatch _checkClock = new();
 
     volatile bool _enabledPublic;
@@ -162,6 +188,7 @@ internal sealed class KeyboardMonitor : IDisposable
 
         Guard("startup", UpdateForeground);
         _trimTimer = SetTimer(IntPtr.Zero, UIntPtr.Zero, TrimDelayMs, IntPtr.Zero); // trim after startup
+        _pollTimer = SetTimer(IntPtr.Zero, UIntPtr.Zero, ForegroundPollMs, IntPtr.Zero);
 
         while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
@@ -194,6 +221,7 @@ internal sealed class KeyboardMonitor : IDisposable
         _held.Clear();
         StopTimer(ref _timer);
         StopTimer(ref _trimTimer);
+        StopTimer(ref _pollTimer);
         RemoveInputHooks();
         UnhookWinEvent(_foregroundHook);
     }
@@ -230,14 +258,12 @@ internal sealed class KeyboardMonitor : IDisposable
 
     void UpdateForeground()
     {
-        GetWindowThreadProcessId(GetForegroundWindow(), out var pid);
+        _lastForegroundWnd = GetForegroundWindow();
+        GetWindowThreadProcessId(_lastForegroundWnd, out var pid);
         _targetPidCache.Remove(pid); // process ids get reused: look again
         bool isZoom = IsTargetProcess(pid);
         _dirty = true; // a window switch may land anywhere
-        _focusMayHaveMoved = true;
-        _lineStartPending = false;
-        _markOnLine = false;
-        _word.Clear();
+        FocusMayHaveMoved();
         if (isZoom && _enabled) _inspector.Prime(pid);
         _zoomInForeground = isZoom;
         ApplyHooks();
@@ -268,6 +294,16 @@ internal sealed class KeyboardMonitor : IDisposable
         }
     }
 
+    /// <summary>A click, window switch or similar: the caret may now be anywhere, in any chat.</summary>
+    void FocusMayHaveMoved()
+    {
+        _focusMayHaveMoved = true;
+        _currentChatKey = null;
+        _lineStartPending = _lineStartEmptyBox = _lastWasSelectAll = false;
+        _markOnLine = false;
+        _word.Clear();
+    }
+
     void RemoveInputHooks()
     {
         if (_keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(_keyboardHook);
@@ -291,10 +327,7 @@ internal sealed class KeyboardMonitor : IDisposable
             if (m is WM_LBUTTONDOWN or WM_RBUTTONDOWN or WM_MBUTTONDOWN or WM_XBUTTONDOWN)
             {
                 _dirty = true; // a click may have moved the caret or switched chats
-                _focusMayHaveMoved = true;
-                _lineStartPending = false;
-                _markOnLine = false;
-                _word.Clear();
+                FocusMayHaveMoved();
             }
         }
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -364,24 +397,28 @@ internal sealed class KeyboardMonitor : IDisposable
             case KeyKind.Neutral:
                 return false;
             case KeyKind.Dirty:
+                if (_log.Enabled) _log.Info($"{DescribeForLog(key)}{ModsForLog()}");
                 if (key.PlainBackspace && _markOnLine && _charsAfterMark == 0)
                 {
                     // This Backspace would only delete our invisible mark, so nothing would visibly happen.
-                    // Delete one more character, so the key press does what the user sees (on an otherwise empty
-                    // line: join it with the line above).
+                    // Delete one more character, so the key press does what the user sees: on an otherwise empty
+                    // line, join it with the line above; on the box's only line, the box is now empty.
+                    bool boxEmptiedNow = _lineFromEmptyBox;
                     MarkDirty(key);
                     _log.Info("Backspace would only delete the invisible mark: deleting one more character");
                     Send([KeyInput(VK_BACK, keyUp: false), KeyInput(VK_BACK, keyUp: true)]);
+                    if (boxEmptiedNow) BoxEmptied();
                     return false;
                 }
                 MarkDirty(key);
                 return false;
         }
 
-        // Printable: only the first character after something that may have started a new line is checked.
-        if (!_dirty)
+        // Printable: only the first character after something that may have started a line is checked.
+        if (!_dirty || !(_lineStartPending || _focusMayHaveMoved))
         {
-            if (_markOnLine) _charsAfterMark++;
+            _dirty = false;
+            Typed();
             return false;
         }
 
@@ -391,15 +428,65 @@ internal sealed class KeyboardMonitor : IDisposable
         return true;
     }
 
+    /// <summary>A character went into the box (passed through or replayed).</summary>
+    void Typed()
+    {
+        if (_markOnLine) _charsAfterMark++;
+        if (_currentChatKey is not null && _typedChats.Count < 1000) _typedChats.Add(_currentChatKey);
+    }
+
+    /// <summary>The box is known to be empty now: the next character starts its first line.</summary>
+    void BoxEmptied()
+    {
+        _lineStartPending = _lineStartEmptyBox = true;
+        if (_currentChatKey is not null) _typedChats.Remove(_currentChatKey);
+    }
+
+    static string ModsForLog()
+    {
+        var m = PhysicalMods();
+        return m == Mods.None ? "" : $" with {m}";
+    }
+
     /// <summary>Applies a caret-moving key (passed through, or replayed) to the line-tracking state.</summary>
     void MarkDirty(HeldKey key)
     {
         _dirty = true;
-        _lineStartPending = key.NewLine || key.SelectAll;
-        if (key.FocusMove) _focusMayHaveMoved = true;
+        if (key.FocusMove)
+        {
+            FocusMayHaveMoved();
+            return;
+        }
+
+        bool sends = Sends(key);
+        bool emptiedAll = _lastWasSelectAll && (key.PlainBackspace || key.PlainDelete); // Ctrl+A, then Delete
+        _lastWasSelectAll = key.SelectAll;
+
         // Only plain Backspace keeps the count of characters after the mark exact; anything else may move the caret.
         if (key.PlainBackspace && _markOnLine && _charsAfterMark > 0) _charsAfterMark--;
         else _markOnLine = false;
+
+        if (sends || emptiedAll || key.SelectAll)
+        {
+            BoxEmptied(); // sent, or about to be replaced/cleared: the next character starts the first line
+            if (key.SelectAll && _currentChatKey is not null) _typedChats.Add(_currentChatKey); // still has text until replaced
+            return;
+        }
+        _lineStartPending = key.NewLine;
+        _lineStartEmptyBox = false;
+    }
+
+    /// <summary>
+    /// Does this key send the message? Zoom's box label says which: "Ctrl+Enter to send a message" (the default)
+    /// or "Enter to send …".
+    /// </summary>
+    bool Sends(HeldKey key)
+    {
+        if (!key.CtrlEnter && !key.PlainEnter) return false;
+        var label = _currentChatKey ?? "";
+        bool ctrlEnterSends = label.Contains("Ctrl+Enter to send", StringComparison.OrdinalIgnoreCase);
+        bool enterSends = !ctrlEnterSends && label.Contains("Enter to send", StringComparison.OrdinalIgnoreCase);
+        return enterSends ? key.PlainEnter : key.CtrlEnter;
     }
 
     /// <summary>
@@ -468,12 +555,15 @@ internal sealed class KeyboardMonitor : IDisposable
         var first = _held[0];
         _dirty = false;
         _checkLineStart = _lineStartPending;
-        _lineStartPending = false;
+        _checkEmptyBox = _lineStartEmptyBox;
+        _checkFocusArrival = _focusMayHaveMoved;
+        _lineStartPending = _lineStartEmptyBox = false;
 
-        // The user typed a direction mark themselves: leave the line alone.
-        if (Bidi.IsDirectionMark(first.Char))
+        // Only a line start (known from the keys) or arriving in a chat is worth asking Zoom about; and if the user
+        // typed a direction mark themselves, the line is left alone.
+        if (!(_checkLineStart || _checkFocusArrival) || Bidi.IsDirectionMark(first.Char))
         {
-            Replay(insertMarker: false, keepFrom: _held.Count);
+            Replay(insertMarker: false, keepFrom: FirstAfterDirty(start: 1));
             return;
         }
 
@@ -483,7 +573,8 @@ internal sealed class KeyboardMonitor : IDisposable
         _focusMayHaveMoved = false;
         _checkClock.Restart();
         if (_log.Enabled)
-            _log.Info($"'{first.Char}' U+{(int)first.Char:X4}: checking (#{id}){(_checkLineStart ? ", new line" : "")}{(mayUseLastChat ? "" : ", focus may have moved")}");
+            _log.Info($"'{first.Char}' U+{(int)first.Char:X4}: checking (#{id})" +
+                $"{(_checkLineStart ? _checkEmptyBox ? ", box emptied" : ", new line" : "")}{(_checkFocusArrival ? ", focus may have moved" : "")}");
         uint hookThread = _threadId;
         _inspector.Query(pid, id, mayUseLastChat, settleMs,
             (rid, state) => PostThreadMessage(hookThread, WM_APP_CHECK_RESULT, rid, (int)state));
@@ -497,10 +588,19 @@ internal sealed class KeyboardMonitor : IDisposable
     {
         if (_phase != Phase.Checking || id != _checkId) return; // stale (already timed out)
         StopTimer(ref _timer);
-        // A line starts where we saw Enter/Ctrl+A just before, or in an empty chat box.
-        bool insert = state == CaretState.ChatEmpty || state == CaretState.ChatNotEmpty && _checkLineStart;
+        var chatKey = _inspector.TakeChatKey(id);
+        bool chat = state is CaretState.ChatEmpty or CaretState.ChatNotEmpty;
+        if (chat) _currentChatKey = chatKey;
+
+        // A line starts where the keys say so (Enter, sent, Ctrl+A...), or where the user just arrived in a chat
+        // whose box is empty - Zoom's "empty" is only current when a chat is opened, so not for chats typed into
+        // since they were last sent.
+        bool emptyOnArrival = _checkFocusArrival && state == CaretState.ChatEmpty
+                              && (chatKey is null || !_typedChats.Contains(chatKey));
+        bool insert = chat && (_checkLineStart || emptyOnArrival);
         _markOnLine = insert; // start counting characters after the mark (Replay counts the ones it sends)
         _charsAfterMark = 0;
+        _lineFromEmptyBox = insert && (emptyOnArrival || _checkEmptyBox);
 
         // Keys after the first caret-moving key (Enter, Backspace, click...) belong to what comes next:
         // they are examined again once this part has been replayed.
@@ -527,6 +627,15 @@ internal sealed class KeyboardMonitor : IDisposable
 
     void OnTimer(UIntPtr timerId)
     {
+        if (timerId == _pollTimer)
+        {
+            if (GetForegroundWindow() != _lastForegroundWnd)
+            {
+                _log.Info("foreground change noticed by the poll (notification missed)");
+                UpdateForeground();
+            }
+            return;
+        }
         if (timerId == _trimTimer)
         {
             StopTimer(ref _trimTimer);
@@ -615,7 +724,7 @@ internal sealed class KeyboardMonitor : IDisposable
         foreach (var h in send)
         {
             if (h.Kind == KeyKind.Dirty) MarkDirty(h);
-            else if (h.Kind == KeyKind.Printable && _markOnLine) _charsAfterMark++;
+            else if (h.Kind == KeyKind.Printable) Typed();
         }
 
         var inputs = BuildInputs(insertMarker, send, endTag: true);
@@ -688,15 +797,23 @@ internal sealed class KeyboardMonitor : IDisposable
         // Enter, Shift+Enter (new line) and Ctrl+Enter (send) all leave the caret at the start of a line.
         bool newLine = k.vkCode == VK_RETURN && !alt && !win;
         bool selectAll = k.vkCode == VK_A && ctrl && !alt && !win;
-        bool focusMove = k.vkCode is VK_TAB or VK_F6 || (mods & (Mods.Alt | Mods.Win)) != 0 && (mods & Mods.Ctrl) == 0;
+        bool plain = !ctrl && !alt && !win;
+        bool shift = (mods & Mods.Shift) != 0;
+        // Keys that may take focus elsewhere: Tab, F6, Alt/Win combinations, and Zoom's chat switching / navigation
+        // shortcuts (Ctrl+Up/Down/PageUp/PageDown, Ctrl+Tab, Ctrl+L, Ctrl+N, Ctrl+W).
+        bool focusMove = k.vkCode is VK_TAB or VK_F6
+                         || (alt || win) && !ctrl
+                         || ctrl && !alt && k.vkCode is VK_UP or VK_DOWN or VK_PRIOR or VK_NEXT or VK_L or VK_N or VK_W;
         bool altGr = ctrl && alt;
-        if (win || ctrl != alt) // shortcut (Ctrl+V, Ctrl+Z, Ctrl+Enter, Alt+Tab, ...)
-            return new HeldKey(k, false, KeyKind.Dirty, '\0', newLine, selectAll, focusMove);
+        var flags = new HeldKey(k, false, KeyKind.Dirty, '\0', newLine, selectAll, focusMove,
+            PlainBackspace: k.vkCode == VK_BACK && plain,
+            PlainDelete: k.vkCode == VK_DELETE && plain,
+            CtrlEnter: k.vkCode == VK_RETURN && ctrl && !alt && !win,
+            PlainEnter: k.vkCode == VK_RETURN && plain && !shift);
+        if (win || ctrl != alt) return flags; // shortcut (Ctrl+V, Ctrl+Z, Ctrl+Enter, Alt+Tab, ...)
 
-        char? ch = Translate(k, threadId, (mods & Mods.Shift) != 0, altGr);
-        if (ch is null) // Enter, Backspace, Delete, arrows, Home/End, Tab, Esc, ...
-            return new HeldKey(k, false, KeyKind.Dirty, '\0', newLine, false, focusMove,
-                PlainBackspace: k.vkCode == VK_BACK && !ctrl && !alt && !win);
+        char? ch = Translate(k, threadId, shift, altGr);
+        if (ch is null) return flags; // Enter, Backspace, Delete, arrows, Home/End, Tab, Esc, ...
         return new HeldKey(k, false, KeyKind.Printable, ch.Value, false, false, false);
     }
 
