@@ -156,6 +156,8 @@ $cases = @(
   @{ name = 'wrong layout, delete, retype'; type = "c`bבדיקה";                         expect = 'L|^בדיקה' }
   @{ name = 'enter picks a mention';      type = "@ab`nשלום";                         expect = "L|^@ab`nL|שלום" }
   @{ name = 'alt tap, then type';         type = "abc⌥d";                              expect = 'L|^abcd' }
+  @{ name = 'backspace joins empty line'; type = "שלום`nab`b`b`bX";                 expect = 'L|^שלוםX' }
+  @{ name = 'backspace empties the box';  type = "abc`b`b`b`bX";                   expect = 'L|^X' }
   @{ name = 'burst: line + next line';    burst = "a`nשלום";                            expect = "L|^a`nL|^שלום" }
   @{ name = 'burst: digits then hebrew';  burst = '12 - שלום';                           expect = 'L|^12 - שלום' }
   @{ name = 'burst: capital next line';   burst = "x`nHello";                           expect = "L|^x`nL|^Hello" }

@@ -67,7 +67,9 @@ internal sealed class KeyboardMonitor : IDisposable
 
     /// <param name="NewLine">Enter/Shift+Enter/Ctrl+Enter that starts a new line (or sends the message).</param>
     /// <param name="SelectAll">Ctrl+A: the next character replaces everything.</param>
-    readonly record struct HeldKey(KBDLLHOOKSTRUCT Data, bool Up, KeyKind Kind, char Char, bool NewLine, bool SelectAll, bool FocusMove);
+    /// <param name="PlainBackspace">Backspace without Ctrl/Alt/Win (deletes exactly one character).</param>
+    readonly record struct HeldKey(KBDLLHOOKSTRUCT Data, bool Up, KeyKind Kind, char Char, bool NewLine, bool SelectAll,
+        bool FocusMove, bool PlainBackspace = false);
 
     [Flags]
     enum Mods { None = 0, Shift = 1, Ctrl = 2, Alt = 4, Win = 8 }
@@ -100,6 +102,12 @@ internal sealed class KeyboardMonitor : IDisposable
     readonly System.Text.StringBuilder _word = new();
     /// <summary>Line start known for the check in progress.</summary>
     bool _checkLineStart;
+    /// <summary>
+    /// We put a mark at the start of this line and, since then, only typing and Backspace happened - so the
+    /// caret is exactly <see cref="_charsAfterMark"/> characters after the mark.
+    /// </summary>
+    bool _markOnLine;
+    int _charsAfterMark;
     /// <summary>Focus may have left the chat box since the last check (click, Tab, window switch).</summary>
     bool _focusMayHaveMoved = true;
     bool _enabled;
@@ -228,6 +236,7 @@ internal sealed class KeyboardMonitor : IDisposable
         _dirty = true; // a window switch may land anywhere
         _focusMayHaveMoved = true;
         _lineStartPending = false;
+        _markOnLine = false;
         _word.Clear();
         if (isZoom && _enabled) _inspector.Prime(pid);
         _zoomInForeground = isZoom;
@@ -284,6 +293,7 @@ internal sealed class KeyboardMonitor : IDisposable
                 _dirty = true; // a click may have moved the caret or switched chats
                 _focusMayHaveMoved = true;
                 _lineStartPending = false;
+                _markOnLine = false;
                 _word.Clear();
             }
         }
@@ -354,12 +364,26 @@ internal sealed class KeyboardMonitor : IDisposable
             case KeyKind.Neutral:
                 return false;
             case KeyKind.Dirty:
+                if (key.PlainBackspace && _markOnLine && _charsAfterMark == 0)
+                {
+                    // This Backspace would only delete our invisible mark, so nothing would visibly happen.
+                    // Delete one more character, so the key press does what the user sees (on an otherwise empty
+                    // line: join it with the line above).
+                    MarkDirty(key);
+                    _log.Info("Backspace would only delete the invisible mark: deleting one more character");
+                    Send([KeyInput(VK_BACK, keyUp: false), KeyInput(VK_BACK, keyUp: true)]);
+                    return false;
+                }
                 MarkDirty(key);
                 return false;
         }
 
         // Printable: only the first character after something that may have started a new line is checked.
-        if (!_dirty) return false;
+        if (!_dirty)
+        {
+            if (_markOnLine) _charsAfterMark++;
+            return false;
+        }
 
         _held.Add(key);
         _heldMods = PhysicalMods();
@@ -367,11 +391,15 @@ internal sealed class KeyboardMonitor : IDisposable
         return true;
     }
 
+    /// <summary>Applies a caret-moving key (passed through, or replayed) to the line-tracking state.</summary>
     void MarkDirty(HeldKey key)
     {
         _dirty = true;
         _lineStartPending = key.NewLine || key.SelectAll;
         if (key.FocusMove) _focusMayHaveMoved = true;
+        // Only plain Backspace keeps the count of characters after the mark exact; anything else may move the caret.
+        if (key.PlainBackspace && _markOnLine && _charsAfterMark > 0) _charsAfterMark--;
+        else _markOnLine = false;
     }
 
     /// <summary>
@@ -471,6 +499,8 @@ internal sealed class KeyboardMonitor : IDisposable
         StopTimer(ref _timer);
         // A line starts where we saw Enter/Ctrl+A just before, or in an empty chat box.
         bool insert = state == CaretState.ChatEmpty || state == CaretState.ChatNotEmpty && _checkLineStart;
+        _markOnLine = insert; // start counting characters after the mark (Replay counts the ones it sends)
+        _charsAfterMark = 0;
 
         // Keys after the first caret-moving key (Enter, Backspace, click...) belong to what comes next:
         // they are examined again once this part has been replayed.
@@ -534,13 +564,16 @@ internal sealed class KeyboardMonitor : IDisposable
         var backlog = _held.ToArray();
         _held.Clear();
         _phase = Phase.Normal;
+        // Find the first character that follows a caret-moving key; the keys before it are applied (MarkDirty,
+        // counting) by Replay when they're sent, so here the state is only simulated.
         int i = 0;
+        bool dirty = _dirty;
         for (; i < backlog.Length; i++)
         {
             var h = backlog[i];
             if (h.Up || h.Kind == KeyKind.Neutral) continue;
-            if (h.Kind == KeyKind.Dirty) { MarkDirty(h); continue; }
-            if (_dirty && _zoomInForeground && _enabled) break; // first character after a caret-moving key
+            if (h.Kind == KeyKind.Dirty) { dirty = true; continue; }
+            if (dirty && _zoomInForeground && _enabled) break; // first character after a caret-moving key
         }
 
         if (i == backlog.Length)
@@ -580,7 +613,10 @@ internal sealed class KeyboardMonitor : IDisposable
         // Caret-moving keys among what's sent (e.g. a fast Enter after the first letter) start a new line or
         // move the caret: the next character must be checked again.
         foreach (var h in send)
+        {
             if (h.Kind == KeyKind.Dirty) MarkDirty(h);
+            else if (h.Kind == KeyKind.Printable && _markOnLine) _charsAfterMark++;
+        }
 
         var inputs = BuildInputs(insertMarker, send, endTag: true);
         _phase = Phase.Draining;
@@ -659,7 +695,8 @@ internal sealed class KeyboardMonitor : IDisposable
 
         char? ch = Translate(k, threadId, (mods & Mods.Shift) != 0, altGr);
         if (ch is null) // Enter, Backspace, Delete, arrows, Home/End, Tab, Esc, ...
-            return new HeldKey(k, false, KeyKind.Dirty, '\0', newLine, false, focusMove);
+            return new HeldKey(k, false, KeyKind.Dirty, '\0', newLine, false, focusMove,
+                PlainBackspace: k.vkCode == VK_BACK && !ctrl && !alt && !win);
         return new HeldKey(k, false, KeyKind.Printable, ch.Value, false, false, false);
     }
 
