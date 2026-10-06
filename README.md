@@ -58,7 +58,8 @@ Just chat in Zoom. Tray icon controls:
   * **Exit**
 
 **Privacy:** ZoomBiDi never connects to the network and never stores what you type. The optional debug log (off
-by default) records only the first character of each new line and the short bit of text before the cursor.
+by default) records only the first character of each new line, and the key codes of non-character keys (Enter,
+Backspace, arrows…).
 
 ---
 
@@ -71,33 +72,39 @@ by default) records only the first character of each new line and the short bit 
   (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) are installed when a Zoom window comes to the front and removed when it
   leaves, so typing in other apps never passes through ZoomBiDi. Hooks run on a dedicated thread, and each key
   is translated with the focused window's keyboard layout (`ToUnicodeEx`).
-* **Cheap by default.** Ordinary typing passes straight through. The app only looks closer at the *first
-  character after something that could have started a new line*: Enter, Backspace, Delete, arrows, Home/End,
-  Tab, mouse clicks, shortcuts (Ctrl+V…), or switching windows.
-* **Checking the caret.** For that character, the key is held while UI Automation inspects the focused element.
-  This runs on a separate MTA thread, calling the UI Automation COM API directly. It checks three things:
-  * The element is a Zoom message box: an Edit control whose accessible name matches `message` (Zoom names it
-    "Message to …").
-  * It belongs to Zoom, or to a child process of Zoom. Zoom's chat is an embedded WebView2, so the box lives in
-    `msedgewebview2.exe`.
-  * Nothing sits between the start of the line and the caret. Chromium reports the caret on a new empty line as
-    before the line break, so an empty line is detected separately via the `TextUnit.Line` range. A selection
-    that starts at the line start counts as the start of the line (typing replaces it, mark included). If the
-    caret is right before the line's existing mark (Home on a line that's already fixed), it's moved past the
-    mark instead, so the mark stays first.
+* **Line starts come from the keys.** Zoom's message box doesn't expose its caret or text to UI Automation (its
+  Text pattern returns only the box's label, "Message to …"), so ZoomBiDi works out where a line starts from
+  what it sees typed. A line starts:
+  * after Enter, Shift+Enter or Ctrl+Enter, except when the word just typed starts with `@` or `:` (then Enter
+    picks from Zoom's mention or emoji list);
+  * after the message is sent (Ctrl+Enter or Enter, whichever Zoom's box label says sends), after Ctrl+A
+    (followed by typing, Delete or Backspace), or when Backspace removed the mark of the box's only line;
+  * when the user arrives in a chat (click, window switch, Tab, Zoom's chat-switching keys) whose box Zoom
+    reports as empty, and which hasn't been typed into since it was last sent. Zoom's accessible name for the
+    box is the label followed by the draft, but only as it was when the chat was opened, so it's trusted only
+    for chats ZoomBiDi hasn't seen typing in.
+
+  Everything else (Backspace, Delete, arrows, Home/End, other shortcuts) never adds a mark.
+* **Cheap by default.** Ordinary typing passes straight through. Only the first character of a line as defined
+  above is held, while UI Automation confirms (on a separate MTA thread, through the COM API directly) that the
+  focus is a Zoom message box: an Edit control named "Message to …", belonging to Zoom or to a child process of
+  Zoom (the chat is an embedded WebView2, so the box lives in `msedgewebview2.exe`).
 * **Replay in order.** The held keys are then replayed with `SendInput`, with U+2068 in front when needed.
-  A typical check takes 3–10 ms (median 6 ms).
+  A typical check takes about 5 ms.
+* **Backspace over the mark.** After inserting a mark, ZoomBiDi counts the characters typed and deleted on that
+  line. When a plain Backspace would delete only the invisible mark (so nothing would visibly happen), it sends
+  one more Backspace: one press then joins an otherwise empty line with the line above, or empties the box.
+  Counting stops at anything that may move the caret, and Backspace is then left alone.
 * **Keys typed during a check.** They're held too, and each is classified as it arrives, using the modifier
   state the held keys themselves produce (so a held Ctrl+V is still seen as a shortcut). If they include a new
   line (e.g. a fast Enter and the next line's first letter), everything up to that point is replayed, and the
-  next line's first character gets its own check. That check waits 40 ms first, so Zoom has processed the
-  replayed keys before UI Automation is asked.
-* **Zoom's accessibility info lags its screen.** Right after Enter, Zoom may still report the previous line for
-  a few milliseconds. A "mid-line" answer right after Enter is therefore re-checked (up to 3 times, 30 ms apart).
-* **Switching keyboard language.** Alt+Shift briefly puts the focus on Zoom's menu bar, often until the next key
-  arrives, which is the very key being held. In that case the chat box from the last check is asked directly,
-  as long as nothing could have moved the focus since (no click, Tab or window switch). Other passing focus
-  states get up to 4 short retries.
+  next line's first character gets its own check, 40 ms later so that Zoom has processed the replayed keys.
+* **Switching keyboard language.** Alt+Shift can leave Zoom's window in menu mode, where the next key would be
+  swallowed by the window menu. When Windows reports menu-bar mode (and no menu is actually open), ZoomBiDi
+  sends Escape before the key. Alt+Shift can also move UI Automation's focus to Zoom's menu bar for a moment:
+  then the chat box from the last check is asked directly, as long as nothing could have moved the focus since.
+* **Missed notifications.** A once-a-second check compares the foreground window with the last one seen, in
+  case a foreground change notification was missed (e.g. while ZoomBiDi was starting).
 * **Small footprint.** Calling the UI Automation COM API directly, instead of the managed
   `System.Windows.Automation` wrapper, means WPF is never loaded. ICU globalization data and background GC are
   off. When Zoom leaves the foreground, the app compacts its heap and releases its working set.
@@ -153,9 +160,11 @@ For the standalone build, use `-p:SelfContained=true -p:EnableCompressionInSingl
 ### Test
 
 `test/testpage.html` is a Chromium contenteditable box labelled like Zoom's chat input. `test/TypeHarness.ps1`
-types 23 cases into it (Hebrew, English and mixed lines, multiple lines, Backspace, Home, arrows, selections,
-and "bursts" sent in one go so that keys arrive while a check is running) and checks exactly where U+2068
-ended up, using an exact comparison (culture-aware string comparison ignores invisible characters).
+types 29 cases into it (Hebrew, English and mixed lines, multiple lines, Backspace over the mark, typos fixed
+mid-line, Home, arrows, selections, Enter picking a mention, Alt taps, and "bursts" sent in one go so that keys
+arrive while a check is running) and checks exactly where U+2068 ended up, using an exact comparison
+(culture-aware string comparison ignores invisible characters). Unlike Zoom, the test page exposes its text, so
+"is the box empty" is always accurate there; the key-based line tracking is the same.
 
 | Option | Effect |
 |---|---|
@@ -185,7 +194,11 @@ anywhere else. The Hebrew and English (US) keyboard layouts must both be install
   happens without ZoomBiDi too): Zoom's editor has no right-to-left support, and no invisible character changes
   it. 16 combinations were tested in Zoom. For the same reason ZoomBiDi doesn't right-align Hebrew lines (Zoom's
   Ctrl+Shift+R would do it, but the caret stays on the wrong side).
+* Because Zoom hides its caret, a line only gets the mark where the keys show it starts (see "How it works").
+  Clicking or pressing Home at the start of a line that already has text and typing there adds no mark. The same
+  goes for returning to a chat whose draft you emptied with Backspace (rather than sending it or Ctrl+A).
 * The chat inside a Zoom *meeting* hasn't been tested and may name its text box differently. If it's ignored
   there, the debug log shows the name, and `ChatNamePattern` can be widened.
-* Not yet tested: @mentions at the start of a line (the mark goes before the `@`).
+* Enter right after a word starting with `@` or `:` is assumed to pick a mention or emoji, so it doesn't start a
+  marked line, even if no list was open.
 * A mouse click within a few milliseconds of a line's first character can reach Zoom before that character.
