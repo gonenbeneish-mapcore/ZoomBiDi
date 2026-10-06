@@ -15,7 +15,12 @@ internal static class Uia
     public const int UIA_TextPatternId = 10014;
     public const int UIA_IsPasswordPropertyId = 30019;
     public const int UIA_EditControlTypeId = 50004;
+    public const int UIA_MenuControlTypeId = 50009;
+    public const int UIA_MenuBarControlTypeId = 50010;
+    public const int UIA_MenuItemControlTypeId = 50011;
     public const int UIA_DocumentControlTypeId = 50030;
+    public const int UIA_WindowControlTypeId = 50032;
+    public const int UIA_PaneControlTypeId = 50033;
 
     public const int TextPatternRangeEndpoint_Start = 0;
     public const int TextPatternRangeEndpoint_End = 1;

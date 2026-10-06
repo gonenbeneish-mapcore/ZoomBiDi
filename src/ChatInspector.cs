@@ -12,7 +12,12 @@ internal enum CaretState
 {
     /// <summary>Focused element is a chat box and nothing precedes the caret on its line.</summary>
     LineStart,
-    /// <summary>Focused element is a chat box, but the line already has content (or a direction mark).</summary>
+    /// <summary>
+    /// Focused element is a chat box; the line already has its mark, but no letters before the caret yet
+    /// (e.g. after Backspace, or Home on a fixed line). The next letter decides the line's alignment.
+    /// </summary>
+    MidLineNoLetters,
+    /// <summary>Focused element is a chat box, and the line already has letters before the caret.</summary>
     MidLine,
     /// <summary>Focused element is not a recognised chat box.</summary>
     NotChat,
@@ -27,7 +32,18 @@ internal enum CaretState
 /// </summary>
 internal sealed class ChatInspector : IDisposable
 {
-    sealed record Request(uint ProcessId, int Id, Action<int, CaretState>? Callback, long Created);
+    sealed record Request(uint ProcessId, int Id, bool AfterEnter, bool MayUseLastChat, int SettleMs,
+        Action<int, CaretState>? Callback, long Created);
+
+    const int MaxTransientRetries = 4;
+    const int TransientRetryDelayMs = 25;
+    /// <summary>
+    /// Zoom's accessibility info lags its screen by a few ms: right after Enter it may still report the previous
+    /// line. A "mid-line" answer right after Enter is therefore re-checked shortly (a real mid-line after Enter,
+    /// e.g. an autocomplete pick, just costs this short wait).
+    /// </summary>
+    const int MaxAfterEnterRechecks = 3;
+    const int AfterEnterRecheckDelayMs = 30;
 
     readonly BlockingCollection<Request> _queue = new();
     readonly Thread _thread;
@@ -45,11 +61,19 @@ internal sealed class ChatInspector : IDisposable
     }
 
     /// <summary>Queues a check; <paramref name="callback"/> runs on the inspector thread.</summary>
-    public void Query(uint processId, int id, Action<int, CaretState> callback) =>
-        _queue.Add(new Request(processId, id, callback, Environment.TickCount64));
+    /// <param name="afterEnter">The last caret-moving key was Enter.</param>
+    /// <param name="mayUseLastChat">
+    /// Nothing that could move focus (click, Tab, window switch) happened since the last check, so if focus is
+    /// momentarily on Zoom's menu bar the chat box from the last check can be asked instead.
+    /// </param>
+    /// <param name="settleMs">
+    /// Wait this long first: keys we just replayed have passed our hook but Zoom may not have processed them yet.
+    /// </param>
+    public void Query(uint processId, int id, bool afterEnter, bool mayUseLastChat, int settleMs, Action<int, CaretState> callback) =>
+        _queue.Add(new Request(processId, id, afterEnter, mayUseLastChat, settleMs, callback, Environment.TickCount64));
 
     /// <summary>Warms up the UIA connection (the first call into a Chromium-based window is slow).</summary>
-    public void Prime(uint processId) => _queue.Add(new Request(processId, 0, null, Environment.TickCount64));
+    public void Prime(uint processId) => _queue.Add(new Request(processId, 0, false, false, 0, null, Environment.TickCount64));
 
     void Worker()
     {
@@ -59,26 +83,51 @@ internal sealed class ChatInspector : IDisposable
             if (Environment.TickCount64 - req.Created > 2000) continue;
 
             var sw = Stopwatch.StartNew();
+            if (req.SettleMs > 0) Thread.Sleep(req.SettleMs);
             CaretState result;
             string detail;
-            var com = new List<object>();
-            try
+            int attempt = 0, enterRechecks = 0;
+            while (true)
             {
-                _uia ??= (IUIAutomation)new CUIAutomation();
-                result = Inspect(req.ProcessId, com, out detail);
-            }
-            catch (Exception ex)
-            {
-                result = CaretState.Unknown;
-                detail = ex.GetType().Name + ": " + ex.Message;
-            }
-            finally
-            {
-                // Release remote UIA objects right away instead of waiting for the GC.
-                foreach (var o in com) Marshal.FinalReleaseComObject(o);
+                bool transient = false;
+                var com = new List<object>();
+                try
+                {
+                    _uia ??= (IUIAutomation)new CUIAutomation();
+                    result = Inspect(req.ProcessId, req.MayUseLastChat, com, out detail, out transient);
+                }
+                catch (Exception ex)
+                {
+                    result = CaretState.Unknown;
+                    detail = ex.GetType().Name + ": " + ex.Message;
+                }
+                finally
+                {
+                    // Release remote UIA objects right away instead of waiting for the GC.
+                    foreach (var o in com) Marshal.FinalReleaseComObject(o);
+                }
+
+                if (req.Callback is null) break;
+
+                // Right after Enter, Zoom may still report the previous line: look again shortly.
+                if (result is CaretState.MidLine or CaretState.MidLineNoLetters && req.AfterEnter && enterRechecks < MaxAfterEnterRechecks)
+                {
+                    enterRechecks++;
+                    Thread.Sleep(AfterEnterRecheckDelayMs);
+                    continue;
+                }
+
+                // Focus can be somewhere else for a moment - e.g. switching keyboard language with Alt+Shift briefly
+                // puts it on the window's menu bar. Ask again shortly instead of giving up on the line.
+                if (!transient || attempt >= MaxTransientRetries) break;
+                attempt++;
+                Thread.Sleep(TransientRetryDelayMs);
             }
             if (req.Callback is null) continue;
-            if (_log.Enabled) _log.Info($"check #{req.Id}: {result} in {sw.ElapsedMilliseconds} ms ({detail})");
+            if (_log.Enabled)
+                _log.Info($"check #{req.Id}: {result} in {sw.ElapsedMilliseconds} ms ({detail})" +
+                    $"{(attempt > 0 ? $" after {attempt} focus retr{(attempt == 1 ? "y" : "ies")}" : "")}" +
+                    $"{(enterRechecks > 0 ? $" after {enterRechecks} after-Enter recheck(s)" : "")}");
             req.Callback(req.Id, result);
         }
     }
@@ -89,10 +138,20 @@ internal sealed class ChatInspector : IDisposable
         return o;
     }
 
-    CaretState Inspect(uint processId, List<object> com, out string detail)
+    /// <param name="transient">
+    /// True when focus isn't on any text box at all (menu bar, window, other process) - typically a passing state,
+    /// worth asking again. False for a definite answer, including "a text box, but not a chat box".
+    /// </param>
+    CaretState Inspect(uint processId, bool mayUseLastChat, List<object> com, out string detail, out bool transient)
     {
+        transient = true;
         var el = _uia!.GetFocusedElement();
-        if (el is null) { detail = "no focused element"; return CaretState.NotChat; }
+        if (el is null)
+        {
+            if (mayUseLastChat) return FromLastChat(processId, "no focused element", com, out detail, ref transient);
+            detail = "no focused element";
+            return CaretState.NotChat;
+        }
         Track(com, el);
 
         // Zoom's chat is an embedded WebView2: the text box lives in a child msedgewebview2.exe process.
@@ -107,12 +166,65 @@ internal sealed class ChatInspector : IDisposable
         var name = el.get_CurrentName() ?? "";
         if (type != Uia.UIA_EditControlTypeId && type != Uia.UIA_DocumentControlTypeId)
         {
-            detail = $"focus is control type {type} '{name}'";
+            var why = $"focus is control type {type} '{name}'";
+            // Switching keyboard language with Alt+Shift can leave focus "on" Zoom's menu bar until the next key
+            // arrives - which is the very key we're holding. If nothing could have moved focus since the last
+            // check (no click, Tab, window switch), ask the chat box from that check directly.
+            if (mayUseLastChat && type is Uia.UIA_MenuBarControlTypeId or Uia.UIA_MenuControlTypeId or Uia.UIA_MenuItemControlTypeId)
+                return FromLastChat(processId, why, com, out detail, ref transient);
+            detail = why;
             return CaretState.NotChat;
         }
-        if (el.GetCurrentPropertyValue(Uia.UIA_IsPasswordPropertyId) is true) { detail = "password box"; return CaretState.NotChat; }
-        if (!_namePattern().IsMatch(name)) { detail = $"name '{name}' does not match"; return CaretState.NotChat; }
+        transient = false;
+        if (el.GetCurrentPropertyValue(Uia.UIA_IsPasswordPropertyId) is true || !_namePattern().IsMatch(name))
+        {
+            ForgetLastChat(); // the user is in some other text box now
+            detail = $"text box '{name}' is not a chat box";
+            return CaretState.NotChat;
+        }
 
+        RememberChat(el, processId, com);
+        return EvaluateChat(el, com, out detail);
+    }
+
+    // The chat box from the last successful check (inspector thread only).
+    IUIAutomationElement? _lastChat;
+    uint _lastChatOwner;
+
+    void RememberChat(IUIAutomationElement el, uint processId, List<object> com)
+    {
+        com.Remove(el); // keep it alive past this check
+        if (!ReferenceEquals(el, _lastChat)) ForgetLastChat();
+        _lastChat = el;
+        _lastChatOwner = processId;
+    }
+
+    void ForgetLastChat()
+    {
+        if (_lastChat is not null) Marshal.FinalReleaseComObject(_lastChat);
+        _lastChat = null;
+    }
+
+    CaretState FromLastChat(uint processId, string why, List<object> com, out string detail, ref bool transient)
+    {
+        if (_lastChat is null || _lastChatOwner != processId) { detail = why; return CaretState.NotChat; }
+        try
+        {
+            var state = EvaluateChat(_lastChat, com, out var d);
+            transient = false;
+            detail = $"{why}; used the chat box from the last check: {d}";
+            return state;
+        }
+        catch (Exception)
+        {
+            ForgetLastChat(); // the box is gone (chat closed, window changed)
+            detail = why;
+            return CaretState.NotChat;
+        }
+    }
+
+    static CaretState EvaluateChat(IUIAutomationElement el, List<object> com, out string detail)
+    {
         if (el.GetCurrentPattern(Uia.UIA_TextPatternId) is IUIAutomationTextPattern tp)
         {
             Track(com, tp);
@@ -147,6 +259,14 @@ internal sealed class ChatInspector : IDisposable
 
         if (prefix.Length == 0)
         {
+            // A selection that starts at the line start will be replaced by what's typed (mark included):
+            // treat it as the start of the line.
+            if (!string.IsNullOrEmpty(caret.GetText(1)))
+            {
+                detail = "selection from the start of the line (will be replaced)";
+                return CaretState.LineStart;
+            }
+
             // Caret at the start of a line that already begins with a mark (e.g. Home on a fixed line):
             // step past the mark so the new text goes after it and the mark stays first.
             var next = Track(com, caret.Clone());
@@ -158,7 +278,7 @@ internal sealed class ChatInspector : IDisposable
                 moved.Move(Uia.TextUnit_Character, 1);
                 moved.Select();
                 detail = "caret was before the line's mark; moved past it";
-                return CaretState.MidLine;
+                return CaretState.MidLineNoLetters;
             }
             detail = "nothing before the caret on this line";
             return CaretState.LineStart;
@@ -175,10 +295,12 @@ internal sealed class ChatInspector : IDisposable
             return CaretState.LineStart;
         }
 
-        detail = prefix.IndexOfAny(Bidi.DirectionMarks) >= 0
-            ? "line already has a direction mark"
-            : $"line has content before the caret ('{Escape(prefix)}')";
-        return CaretState.MidLine;
+        bool hasLetters = false;
+        foreach (var c in prefix)
+            if (Bidi.IsLetterOrObject(c)) { hasLetters = true; break; }
+        bool hasMark = prefix.IndexOfAny(Bidi.DirectionMarks) >= 0;
+        detail = $"line has {(hasMark ? "a mark and " : "")}{(hasLetters ? "letters" : "no letters")} before the caret ('{Escape(prefix)}')";
+        return hasLetters ? CaretState.MidLine : CaretState.MidLineNoLetters;
     }
 
     static bool IsAllLineBreaks(string s)

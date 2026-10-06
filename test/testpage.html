@@ -7,16 +7,18 @@
   body { font: 16px "Segoe UI", sans-serif; margin: 16px; }
   #box { border: 1px solid #888; min-height: 90px; padding: 6px; white-space: pre-wrap; font-size: 18px; }
   #view { margin-top: 10px; padding: 6px; background: #f3f3f3; white-space: pre-wrap; min-height: 2em; font-size: 18px; }
+  #view div { border-bottom: 1px dashed #ccc; }
   .mark { background: #ffd54f; border-radius: 3px; padding: 0 3px; font-size: 12px; font-weight: 600; }
   #history { margin-top: 14px; font-size: 15px; }
   #history div { border-bottom: 1px solid #ddd; padding: 3px 0; white-space: pre-wrap; }
 </style>
 </head>
 <body>
-<p>Test chat box (stand-in for Zoom's chat input). Typed text:</p>
-<div id="box" contenteditable="true" dir="auto" role="textbox" aria-multiline="true"
+<p>Test chat box (stand-in for Zoom's chat input). Like Zoom, Ctrl+Shift+R / Ctrl+Shift+L right/left-align the
+current line, and a new line inherits the alignment. Typed text:</p>
+<div id="box" contenteditable="true" role="textbox" aria-multiline="true"
      aria-label="Message to test, Ctrl+Enter to send a message"></div>
-<p>Same text with invisible direction marks shown (<span class="mark">RLI</span> = U+2067):</p>
+<p>Same text, line by line, with invisible direction marks shown (<span class="mark">RLI</span> = U+2067):</p>
 <div id="view"></div>
 <p>History (each line = one test case, newest first):</p>
 <div id="history"></div>
@@ -25,23 +27,88 @@
   const view = document.getElementById('view');
   const history = document.getElementById('history');
   const names = { 0x2066: 'LRI', 0x2067: 'RLI', 0x2068: 'FSI', 0x2069: 'PDI', 0x200E: 'LRM', 0x200F: 'RLM' };
+
   function visualize(t, el) {
-    el.textContent = '';
     for (const c of t) {
       const n = names[c.codePointAt(0)];
       if (n) { const s = document.createElement('span'); s.className = 'mark'; s.textContent = n; el.append(s); }
       else el.append(c);
     }
   }
+
+  // Lines of the box as [{ align: 'L' | 'R', text }]. Chromium keeps the first line as bare text and wraps
+  // later lines in <div>s.
+  function lines() {
+    const out = [];
+    let pending = null;
+    for (const n of box.childNodes) {
+      if (n.nodeType === Node.TEXT_NODE) {
+        if (!pending) { pending = { align: 'L', text: '' }; out.push(pending); }
+        pending.text += n.textContent;
+      } else if (n.nodeName === 'BR') {
+        pending = null;
+      } else {
+        pending = null;
+        const align = getComputedStyle(n).textAlign === 'right' ? 'R' : 'L';
+        out.push({ align, text: n.innerText.replace(/\n$/, '') });
+      }
+    }
+    return out;
+  }
+
+  // The block (direct child of the box) holding the caret; bare first-line text gets wrapped in a <div>.
+  function currentBlock() {
+    const sel = getSelection();
+    if (!sel.rangeCount) return null;
+    let n = sel.anchorNode;
+    if (n === box) n = box.childNodes[Math.min(sel.anchorOffset, box.childNodes.length - 1)] || null;
+    while (n && n.parentNode !== box) n = n.parentNode;
+    if (!n) return null;
+    if (n.nodeType === Node.TEXT_NODE) {
+      const offset = sel.anchorNode === n ? sel.anchorOffset : n.textContent.length;
+      const div = document.createElement('div');
+      box.insertBefore(div, n);
+      div.appendChild(n);
+      const r = document.createRange(); r.setStart(n, offset); r.collapse(true);
+      sel.removeAllRanges(); sel.addRange(r);
+      return div;
+    }
+    return n;
+  }
+
+  box.addEventListener('keydown', e => {
+    if (e.ctrlKey && e.shiftKey && !e.altKey && (e.code === 'KeyR' || e.code === 'KeyL')) {
+      e.preventDefault();
+      if (!box.firstChild) box.appendChild(document.createElement('div')).appendChild(document.createElement('br'));
+      const block = currentBlock();
+      if (block) block.style.textAlign = e.code === 'KeyR' ? 'right' : 'left';
+      update();
+    }
+  });
+
   let last = '';
   function update() {
-    const t = box.innerText.replace(/\n$/, '');
-    if (t === '' && last !== '') {
-      const d = document.createElement('div'); d.dir = 'auto'; visualize(last.replace(/\n/g, ' ⏎ '), d); history.prepend(d);
+    const ls = lines();
+    if (box.innerText.trim() === '') {
+      if (last !== '') {
+        const d = document.createElement('div'); d.dir = 'auto'; visualize(last, d); history.prepend(d);
+      }
+      last = '';
+      if (box.childNodes.length) box.innerHTML = '';   // cleared: drop leftover alignment, like a fresh box
+      view.textContent = '';
+      document.title = 'ZTDF-TEST|';
+      return;
     }
-    last = t;
-    visualize(t, view);
-    document.title = 'ZTDF-TEST|' + t.replace(/\n/g, '⏎');
+    const encoded = ls.map(l => l.align + '|' + l.text);
+    last = encoded.join(' ⏎ ');
+    view.textContent = '';
+    for (const l of ls) {
+      const d = document.createElement('div');
+      d.style.textAlign = l.align === 'R' ? 'right' : 'left';
+      visualize(l.text, d);
+      view.append(d);
+    }
+    document.title = 'ZTDF-TEST|' + encoded.join('⏎');
   }
   box.addEventListener('input', update);
   window.addEventListener('load', () => box.focus());
