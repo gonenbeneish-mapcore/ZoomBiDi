@@ -26,8 +26,6 @@ way the line goes. ZoomBiDi does that for you automatically:
 * Every time you start a new line in a Zoom chat box, it slips U+2068 (FIRST STRONG ISOLATE) in at the start of
   the line. That character gives the line the direction of its first letter: lines that start in Hebrew read
   right-to-left, and lines that start in English stay left-to-right (`hello שלום` stays `hello שלום`).
-* A line that starts with an @mention takes its direction from the name, so `@mctester שלום` keeps the name on
-  the left.
 * Search boxes and other fields in Zoom aren't touched. Outside Zoom it does nothing at all.
 * It's light: about 3 MB of memory while you're in other apps, about 12–17 MB while Zoom is in front, and no
   CPU at all outside Zoom. The first character of a line is held for a few milliseconds (median 6 ms); the rest
@@ -93,12 +91,6 @@ Backspace, arrows…).
   Zoom (the chat is an embedded WebView2, so the box lives in `msedgewebview2.exe`).
 * **Replay in order.** The held keys are then replayed with `SendInput`, with U+2068 in front when needed.
   A typical check takes about 5 ms.
-* **Mentions.** Chromium skips Zoom's mention chip when it works out a line's direction, so U+2068 in front of
-  `@name שלום` would make the line right-to-left. A line that starts with `@` is therefore marked by the name's
-  first letter instead: U+2066 (LEFT-TO-RIGHT ISOLATE) for English, U+2067 (RIGHT-TO-LEFT ISOLATE) for Hebrew.
-  The mark goes in with the `@` as usual. When the first letter arrives, ZoomBiDi deletes the mark and the `@`
-  (two Backspaces), types them again with the right mark, then the letter. That works even with a language switch
-  in between.
 * **Backspace over the mark.** After inserting a mark, ZoomBiDi counts the characters typed and deleted on that
   line. When a plain Backspace would delete only the invisible mark (so nothing would visibly happen), it sends
   one more Backspace: one press then joins an otherwise empty line with the line above, or empties the box.
@@ -168,10 +160,9 @@ For the standalone build, use `-p:SelfContained=true -p:EnableCompressionInSingl
 ### Test
 
 `test/testpage.html` is a Chromium contenteditable box labelled like Zoom's chat input. `test/TypeHarness.ps1`
-types 38 cases into it (Hebrew, English and mixed lines, multiple lines, Backspace over the mark, typos fixed
-mid-line, Home, arrows, selections, lines starting with a mention, Enter picking a mention, Alt taps, and "bursts"
-sent in one go so that keys arrive while a check is running) and checks exactly which mark ended up where, using
-an exact comparison
+types 31 cases into it (Hebrew, English and mixed lines, multiple lines, Backspace over the mark, typos fixed
+mid-line, Home, arrows, selections, Enter picking a mention, Alt taps, and "bursts" sent in one go so that keys
+arrive while a check is running) and checks exactly where U+2068 ended up, using an exact comparison
 (culture-aware string comparison ignores invisible characters). Unlike Zoom, the test page exposes its text, so
 "is the box empty" is always accurate there; the key-based line tracking is the same.
 

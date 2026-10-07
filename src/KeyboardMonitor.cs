@@ -45,7 +45,6 @@ internal sealed class KeyboardMonitor : IDisposable
     /// them (and updates what UI Automation reports) a little later.
     /// </summary>
     const int BacklogSettleMs = 40;
-    const char FirstStrongIsolate = (char)0x2068, LeftToRightIsolate = (char)0x2066, RightToLeftIsolate = (char)0x2067;
     const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75, VK_ESCAPE = 0x1B, VK_A = 0x41, VK_DELETE = 0x2E;
     const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_UP = 0x26, VK_DOWN = 0x28, VK_L = 0x4C, VK_N = 0x4E, VK_W = 0x57;
     const uint GUI_INMENUMODE = 0x4, GUI_SYSTEMMENUMODE = 0x8, GUI_POPUPMENUMODE = 0x10;
@@ -131,19 +130,12 @@ internal sealed class KeyboardMonitor : IDisposable
     /// </summary>
     bool _markOnLine;
     int _charsAfterMark;
-    /// <summary>
-    /// The line is our mark + "@" so far: the first letter of the name decides which mark the line needs (see
-    /// <see cref="TryFixMentionLine"/>).
-    /// </summary>
-    bool _mentionPending;
     /// <summary>Focus may have left the chat box since the last check (click, Tab, window switch).</summary>
     bool _focusMayHaveMoved = true;
     bool _enabled;
     bool _zoomInForeground;
     Phase _phase = Phase.Normal;
     int _checkId;
-    /// <summary>The mark the next replay with a marker puts in front (normally the one from the settings).</summary>
-    char _lineMarker;
     /// <summary>Modifier state as the held keys leave it (physical state at the start of holding + held events).</summary>
     Mods _heldMods;
     UIntPtr _timer, _trimTimer, _pollTimer;
@@ -309,7 +301,7 @@ internal sealed class KeyboardMonitor : IDisposable
         _focusMayHaveMoved = true;
         _currentChatKey = null;
         _lineStartPending = _lineStartEmptyBox = _lastWasSelectAll = false;
-        _markOnLine = _mentionPending = false;
+        _markOnLine = false;
         _word.Clear();
     }
 
@@ -390,9 +382,7 @@ internal sealed class KeyboardMonitor : IDisposable
 
         // Switching keyboard language with Alt+Shift can leave Zoom's window in menu mode, where the next key is
         // swallowed by the (invisible) window menu. Leave menu mode first, then pass the key on.
-        bool menuMode = key.Kind != KeyKind.Neutral && k.vkCode != VK_ESCAPE && InMenuBarMode(threadId);
-        if (key.Kind == KeyKind.Printable && TryFixMentionLine(key, menuMode)) return true;
-        if (menuMode)
+        if (key.Kind != KeyKind.Neutral && k.vkCode != VK_ESCAPE && InMenuBarMode(threadId))
         {
             _log.Info($"Zoom's window is in menu mode: sending Escape before {DescribeForLog(key)}");
             Send([KeyInput(VK_ESCAPE, keyUp: false), KeyInput(VK_ESCAPE, keyUp: true)]);
@@ -444,7 +434,6 @@ internal sealed class KeyboardMonitor : IDisposable
     {
         _lastWasSelectAll = false; // Ctrl+A, then typing: the selection is gone, a later Backspace is just a Backspace
         if (_markOnLine) _charsAfterMark++;
-        _mentionPending &= _markOnLine && _charsAfterMark == 1; // still just "@" after the mark
         if (_currentChatKey is not null && _typedChats.Count < 1000) _typedChats.Add(_currentChatKey);
     }
 
@@ -465,7 +454,6 @@ internal sealed class KeyboardMonitor : IDisposable
     void MarkDirty(HeldKey key)
     {
         _dirty = true;
-        _mentionPending = false;
         if (key.FocusMove)
         {
             FocusMayHaveMoved();
@@ -617,87 +605,14 @@ internal sealed class KeyboardMonitor : IDisposable
         _charsAfterMark = 0;
         _lineFromEmptyBox = insert && (emptyOnArrival || _checkEmptyBox);
 
-        if (_log.Enabled)
-            _log.Info($"check #{id} -> {state} after {_checkClock.ElapsedMilliseconds} ms, {(insert ? "inserting marker" : "no marker")}");
-
-        char marker = _settings.MarkerChar;
-        if (insert && _held[0].Char == '@' && marker == FirstStrongIsolate)
-        {
-            // The line starts with a mention. If the name's first letter was typed already, mark the line by it;
-            // otherwise mark it as usual and fix the mark when that letter comes (TryFixMentionLine).
-            int next = NextKeyDown(1);
-            if (next < 0) _mentionPending = true; // Replay clears it if anything else is sent along
-            else if (_held[next].Kind == KeyKind.Printable && !ModifierBetween(1, next))
-                marker = MentionMarker(_held[next].Char);
-        }
-        ReplayLine(insert, marker);
-    }
-
-    /// <summary>
-    /// Replays the held line start, with <paramref name="marker"/> in front if <paramref name="insert"/>. Keys after
-    /// the first caret-moving key (Enter, Backspace, click...) belong to what comes next: they are examined again
-    /// once this part has been replayed.
-    /// </summary>
-    void ReplayLine(bool insert, char marker)
-    {
+        // Keys after the first caret-moving key (Enter, Backspace, click...) belong to what comes next:
+        // they are examined again once this part has been replayed.
         int keepFrom = FirstAfterDirty(start: 1);
+
         if (_log.Enabled)
-            _log.Info($"replaying {keepFrom} key event(s){(insert ? $" after U+{(int)marker:X4}" : "")}" +
-                $"{(keepFrom < _held.Count ? $", {_held.Count - keepFrom} more to examine" : "")}");
-        _lineMarker = marker;
+            _log.Info($"check #{id} -> {state} after {_checkClock.ElapsedMilliseconds} ms, {(insert ? "inserting marker" : "no marker")}" +
+                $", replaying {keepFrom} key event(s){(keepFrom < _held.Count ? $", {_held.Count - keepFrom} more to examine" : "")}");
         Replay(insert, keepFrom);
-    }
-
-    /// <summary>
-    /// The mark for a line that starts with a mention: Zoom's mention chip is skipped when Chromium works out the
-    /// direction of a line, so the plain marker would take it from the text after the name. The name's first letter
-    /// decides instead.
-    /// </summary>
-    static char MentionMarker(char firstLetter) => Bidi.StrongDirection(firstLetter) switch
-    {
-        > 0 => LeftToRightIsolate,
-        < 0 => RightToLeftIsolate,
-        _ => FirstStrongIsolate,
-    };
-
-    /// <summary>
-    /// The line is our mark + "@" and <paramref name="key"/> is the first letter of the name: replace the mark by
-    /// the one that letter calls for (two Backspaces, then the mark and "@" again), then type the letter.
-    /// </summary>
-    /// <returns>true if the key was taken over.</returns>
-    bool TryFixMentionLine(HeldKey key, bool menuMode)
-    {
-        if (!_mentionPending) return false;
-        _mentionPending = false;
-        char marker = MentionMarker(key.Char);
-        if (!_markOnLine || _charsAfterMark != 1 || _dirty || marker == FirstStrongIsolate) return false;
-
-        if (_log.Enabled) _log.Info($"line starts with '@' + {DescribeForLog(key)}: changing its mark to U+{(int)marker:X4}");
-        var prefix = new List<INPUT>(10);
-        if (menuMode) { prefix.Add(KeyInput(VK_ESCAPE, keyUp: false)); prefix.Add(KeyInput(VK_ESCAPE, keyUp: true)); }
-        for (int i = 0; i < 2; i++) { prefix.Add(KeyInput(VK_BACK, keyUp: false)); prefix.Add(KeyInput(VK_BACK, keyUp: true)); }
-        foreach (var c in new[] { marker, '@' }) { prefix.Add(UnicodeKey(c, keyUp: false)); prefix.Add(UnicodeKey(c, keyUp: true)); }
-        _held.Add(key);
-        _heldMods = PhysicalMods();
-        Replay(insertMarker: false, keepFrom: _held.Count, prefix: prefix);
-        return true;
-    }
-
-    /// <summary>Is there a Ctrl, Alt or Win key event in _held[from..to)? (A language switch: keys after it are read wrong.)</summary>
-    bool ModifierBetween(int from, int to)
-    {
-        for (int i = from; i < to; i++)
-            if (_held[i].Data.vkCode is VK_CONTROL or VK_LCONTROL or VK_RCONTROL or VK_MENU or VK_LMENU or VK_RMENU or VK_LWIN or VK_RWIN)
-                return true;
-        return false;
-    }
-
-    /// <summary>Index of the first key-down that isn't a modifier, at or after <paramref name="start"/>, or -1.</summary>
-    int NextKeyDown(int start)
-    {
-        for (int i = start; i < _held.Count; i++)
-            if (!_held[i].Up && _held[i].Kind != KeyKind.Neutral) return i;
-        return -1;
     }
 
     /// <summary>Index of the first printable key-down that follows a caret-moving key, at or after <paramref name="start"/>.</summary>
@@ -798,7 +713,7 @@ internal sealed class KeyboardMonitor : IDisposable
     /// Sends _held[0..keepFrom) (with the marker in front, if asked) and keeps _held[keepFrom..]
     /// (plus <paramref name="extra"/>) held.
     /// </summary>
-    void Replay(bool insertMarker, int keepFrom, HeldKey[]? extra = null, List<INPUT>? prefix = null)
+    void Replay(bool insertMarker, int keepFrom, HeldKey[]? extra = null)
     {
         keepFrom = Math.Clamp(keepFrom, 0, _held.Count);
         var send = _held.GetRange(0, keepFrom).ToArray();
@@ -815,7 +730,7 @@ internal sealed class KeyboardMonitor : IDisposable
             else if (h.Kind == KeyKind.Printable) Typed();
         }
 
-        var inputs = BuildInputs(insertMarker, send, endTag: true, prefix);
+        var inputs = BuildInputs(insertMarker, send, endTag: true);
         _phase = Phase.Draining;
         if (inputs.Length > 0 && Send(inputs))
         {
@@ -829,13 +744,12 @@ internal sealed class KeyboardMonitor : IDisposable
         }
     }
 
-    INPUT[] BuildInputs(bool insertMarker, HeldKey[] keys, bool endTag, List<INPUT>? prefix = null)
+    INPUT[] BuildInputs(bool insertMarker, HeldKey[] keys, bool endTag)
     {
         var list = new List<INPUT>(keys.Length + 2);
-        if (prefix is not null) list.AddRange(prefix);
         if (insertMarker)
         {
-            var marker = _lineMarker != '\0' ? _lineMarker : _settings.MarkerChar;
+            var marker = _settings.MarkerChar;
             list.Add(UnicodeKey(marker, keyUp: false));
             list.Add(UnicodeKey(marker, keyUp: true));
         }
