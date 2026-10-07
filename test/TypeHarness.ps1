@@ -115,6 +115,7 @@ function Type-Text([string]$s) {
     elseif ($c -eq [char]0x21F1) { [H]::ShiftHome() }  # ⇱ = Shift+Home
     elseif ($c -eq [char]0x24B6) { [H]::CtrlA() }  # Ⓐ = Ctrl+A
     elseif ($c -eq [char]0x2325) { [H]::Vk(0x12) }  # ⌥ = Alt pressed and released alone
+    elseif ($c -eq [char]0x23F8) { Start-Sleep -Milliseconds 900 }  # ⏸ = pause
     elseif ($Mode -eq 'unicode') { [H]::Char($c) }
     else {
       if (Is-Hebrew $c) { Use-Layout $hebrew } elseif (Is-Latin $c) { Use-Layout $english }
@@ -131,8 +132,9 @@ function Type-Text([string]$s) {
 function Clear-Box { Assert-Fg; [H]::CtrlA(); Start-Sleep -Milliseconds 80; Assert-Fg; [H]::Vk(0x2E); Start-Sleep -Milliseconds 300 }
 
 # Each expected line is "<alignment>|<text>" as the test page reports it (always L: ZoomBiDi doesn't align lines).
-# ^ marks where U+2068 should be inserted: at the start of every line.
-# `n = Enter, `b = Backspace, ← = Left arrow, ⇤ = Home, ⇱ = Shift+Home, Ⓐ = Ctrl+A, ⌥ = Alt tap.
+# ^ marks where U+2068 should be inserted: at the start of every line. A line starting with "@" (a mention) gets
+# U+2066 (>) or U+2067 (<) instead, from the first letter of the name.
+# `n = Enter, `b = Backspace, ← = Left arrow, ⇤ = Home, ⇱ = Shift+Home, Ⓐ = Ctrl+A, ⌥ = Alt tap, ⏸ = pause.
 $cases = @(
   @{ name = 'hebrew only';                type = 'שלום לכולם';                        expect = 'L|^שלום לכולם' }
   @{ name = 'hebrew then english';        type = 'שלום world';                         expect = 'L|^שלום world' }
@@ -154,7 +156,13 @@ $cases = @(
   @{ name = 'select line, retype';        type = "abc⇱X";                              expect = 'L|X' }
   @{ name = 'select all, retype hebrew';  type = "abcⒶש";                              expect = 'L|^ש' }
   @{ name = 'wrong layout, delete, retype'; type = "c`bבדיקה";                         expect = 'L|^בדיקה' }
-  @{ name = 'enter picks a mention';      type = "@ab`nשלום";                         expect = "L|^@ab`nL|שלום" }
+  @{ name = 'enter picks a mention';      type = "@ab`nשלום";                         expect = "L|>@ab`nL|שלום" }
+  @{ name = 'english mention, hebrew';    type = "@mc שלום";                           expect = 'L|>@mc שלום' }
+  @{ name = 'hebrew mention, english';    type = "@דנ hello";                          expect = 'L|<@דנ hello' }
+  @{ name = 'mention, pause, then name';  type = "@⏸mc";                              expect = 'L|>@mc' }
+  @{ name = 'mention, backspace, hebrew'; type = "@`bשלום";                            expect = 'L|^שלום' }
+  @{ name = '@ then digits';              type = "@12 שלום";                           expect = 'L|^@12 שלום' }
+  @{ name = 'mention on second line';     type = "שלום`n@ab";                          expect = "L|^שלום`nL|>@ab" }
   @{ name = 'alt tap, then type';         type = "abc⌥d";                              expect = 'L|^abcd' }
   @{ name = 'backspace joins empty line'; type = "שלום`nab`b`b`bX";                 expect = 'L|^שלוםX' }
   @{ name = 'backspace empties the box';  type = "abc`b`b`b`bX";                   expect = 'L|^X' }
@@ -165,6 +173,7 @@ $cases = @(
   @{ name = 'burst: digits then hebrew';  burst = '12 - שלום';                           expect = 'L|^12 - שלום' }
   @{ name = 'burst: capital next line';   burst = "x`nHello";                           expect = "L|^x`nL|^Hello" }
   @{ name = 'burst: three lines';         burst = "שלום`nhi`nעוד";                       expect = "L|^שלום`nL|^hi`nL|^עוד" }
+  @{ name = 'burst: mention';             burst = "@ab שלום";                            expect = 'L|>@ab שלום' }
 )
 if ($Only) { $cases = @($Only | ForEach-Object { $cases[$_] }) }
 if (-not [H]::Activate('ZTDF-TEST')) { throw 'test page window not found' }
@@ -178,8 +187,8 @@ try {
     else { Type-Text $c.type }
     Start-Sleep -Milliseconds 400
     $got = ([H]::FgTitle() -replace '^ZTDF-TEST\|', '')
-    $want = $c.expect.Replace('^', [string][char]0x2068).Replace("`n", '⏎')
-    $show = { param($s) [regex]::Replace($s, "\u2068", "^") }
+    $want = $c.expect.Replace('^', [string][char]0x2068).Replace('>', [string][char]0x2066).Replace('<', [string][char]0x2067).Replace("`n", '⏎')
+    $show = { param($s) $s.Replace([string][char]0x2068, '^').Replace([string][char]0x2066, '>').Replace([string][char]0x2067, '<') }
     if ([string]::Equals($got, $want, [StringComparison]::Ordinal)) { "PASS  {0,-27} {1}" -f $c.name, (& $show $got) }
     else { $fail++; "FAIL  {0,-27} got:  {1}`n      {2,-27} want: {3}" -f $c.name, (& $show $got), '', (& $show $want) }
   }
