@@ -589,21 +589,27 @@ internal sealed class KeyboardMonitor : IDisposable
 
     void OnCheckResult(int id, CaretState state)
     {
-        var chatKey = _inspector.TakeChatKey(id); // collect it even for a stale result, so nothing piles up
+        var info = _inspector.TakeChatInfo(id); // collect it even for a stale result, so nothing piles up
         if (_phase != Phase.Checking || id != _checkId) return; // stale (already timed out)
         StopTimer(ref _timer);
         bool chat = state is CaretState.ChatEmpty or CaretState.ChatNotEmpty;
+        var chatKey = info?.Key;
+        bool live = info?.Live == true;
         if (chat) _currentChatKey = chatKey;
+        if (chat && live && state == CaretState.ChatEmpty && chatKey is not null) _typedChats.Remove(chatKey);
 
         // A line starts where the keys say so (Enter, sent, Ctrl+A...), or where the user just arrived in a chat
-        // whose box is empty - Zoom's "empty" is only current when a chat is opened, so not for chats typed into
-        // since they were last sent.
+        // whose box is empty. "Empty" is up to date when it comes from Zoom's Send button; otherwise (from the box's
+        // name) it is only current when a chat is opened, so not for chats typed into since they were last sent.
         bool emptyOnArrival = _checkFocusArrival && state == CaretState.ChatEmpty
-                              && (chatKey is null || !_typedChats.Contains(chatKey));
-        bool insert = chat && (_checkLineStart || emptyOnArrival);
+                              && (live || chatKey is null || !_typedChats.Contains(chatKey));
+        // Zoom's editor also shows which line the caret is on: arriving on an empty line (clicking below the text,
+        // say) starts a line too.
+        bool emptyLineOnArrival = _checkFocusArrival && info?.CaretLineEmpty == true;
+        bool insert = chat && (_checkLineStart || emptyOnArrival || emptyLineOnArrival);
         _markOnLine = insert; // start counting characters after the mark (Replay counts the ones it sends)
         _charsAfterMark = 0;
-        _lineFromEmptyBox = insert && (emptyOnArrival || _checkEmptyBox);
+        _lineFromEmptyBox = insert && (emptyOnArrival || _checkEmptyBox || live && state == CaretState.ChatEmpty);
 
         // Keys after the first caret-moving key (Enter, Backspace, click...) belong to what comes next:
         // they are examined again once this part has been replayed.

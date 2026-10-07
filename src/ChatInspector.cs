@@ -39,13 +39,22 @@ internal sealed class ChatInspector : IDisposable
     const int TransientRetryDelayMs = 25;
 
     readonly BlockingCollection<Request> _queue = new();
-    /// <summary>Which chat box each finished check was about (request id → key), collected by the hook thread.</summary>
-    readonly ConcurrentDictionary<int, string> _chatKeys = new();
+    /// <summary>What each finished check found out about the chat box (request id → info), collected by the hook thread.</summary>
+    readonly ConcurrentDictionary<int, ChatInfo> _chatInfo = new();
 
     /// <summary>
-    /// The identity of the chat box a check found ("Message to …" label), or null. Call once per check result.
+    /// The chat box a check found: <paramref name="Key"/> identifies it ("Message to …" label). <paramref name="Live"/>:
+    /// "empty or not" is up to date (read from Zoom's Send button, which is disabled while the box is empty), not
+    /// from the box's name, which only changes when the chat is opened.
     /// </summary>
-    public string? TakeChatKey(int id) => _chatKeys.TryRemove(id, out var key) ? key : null;
+    /// <param name="CaretLineEmpty">
+    /// The line the caret is on has no text (from Zoom's editor, which shows its lines and, through its hidden input
+    /// box, where the caret is); null if that couldn't be worked out.
+    /// </param>
+    public readonly record struct ChatInfo(string Key, bool Live, bool? CaretLineEmpty = null);
+
+    /// <summary>What a check found about the chat box, or null. Call once per check result.</summary>
+    public ChatInfo? TakeChatInfo(int id) => _chatInfo.TryRemove(id, out var info) ? info : null;
     readonly Thread _thread;
     readonly Logger _log;
     readonly Func<Regex> _namePattern;
@@ -85,7 +94,7 @@ internal sealed class ChatInspector : IDisposable
             if (req.SettleMs > 0) Thread.Sleep(req.SettleMs);
             CaretState result;
             string detail;
-            string? chatKey = null;
+            ChatInfo? chatInfo = null;
             int attempt = 0;
             while (true)
             {
@@ -94,7 +103,7 @@ internal sealed class ChatInspector : IDisposable
                 try
                 {
                     _uia ??= (IUIAutomation)new CUIAutomation();
-                    result = Inspect(req.ProcessId, req.MayUseLastChat, com, out detail, out transient, out chatKey);
+                    result = Inspect(req.ProcessId, req.MayUseLastChat, com, out detail, out transient, out chatInfo);
                 }
                 catch (Exception ex)
                 {
@@ -113,7 +122,7 @@ internal sealed class ChatInspector : IDisposable
                 Thread.Sleep(TransientRetryDelayMs);
             }
             if (req.Callback is null) continue;
-            if (chatKey is not null) _chatKeys[req.Id] = chatKey;
+            if (chatInfo is not null) _chatInfo[req.Id] = chatInfo.Value;
             if (_log.Enabled)
                 _log.Info($"check #{req.Id}: {result} in {sw.ElapsedMilliseconds} ms ({detail})" +
                     $"{(attempt > 0 ? $" after {attempt} focus retr{(attempt == 1 ? "y" : "ies")}" : "")}");
@@ -132,7 +141,7 @@ internal sealed class ChatInspector : IDisposable
     /// worth asking again. False for a definite answer, including "a text box, but not a chat box".
     /// </param>
     CaretState Inspect(uint processId, bool mayUseLastChat, List<object> com, out string detail, out bool transient,
-        out string? chatKey)
+        out ChatInfo? chatKey)
     {
         transient = true;
         chatKey = null;
@@ -197,7 +206,7 @@ internal sealed class ChatInspector : IDisposable
     }
 
     CaretState FromLastChat(uint processId, string why, List<object> com, out string detail, ref bool transient,
-        out string? chatKey)
+        out ChatInfo? chatKey)
     {
         chatKey = null;
         if (_lastChat is null || _lastChatOwner != processId) { detail = why; return CaretState.NotChat; }
@@ -217,11 +226,11 @@ internal sealed class ChatInspector : IDisposable
     }
 
     /// <summary>
-    /// Does the chat box look empty? For Zoom's box this comes from the name (label + the draft as it was when the
-    /// chat was opened - it isn't updated while typing), so the hook only trusts it when the user just arrived in
-    /// the chat. <paramref name="chatKey"/> identifies the chat (Zoom's "Message to …" label).
+    /// Is the chat box empty? Zoom's Send button says so, up to date (disabled while the box is empty). Without it,
+    /// for Zoom's box this comes from the name (label + the draft as it was when the chat was opened - it isn't
+    /// updated while typing), so the hook only trusts it when the user just arrived in a chat not typed into yet.
     /// </summary>
-    static CaretState EvaluateChat(IUIAutomationElement el, string name, List<object> com, out string detail, out string chatKey)
+    CaretState EvaluateChat(IUIAutomationElement el, string name, List<object> com, out string detail, out ChatInfo? info)
     {
         string? text = null;
         if (el.GetCurrentPattern(Uia.UIA_TextPatternId) is IUIAutomationTextPattern tp)
@@ -236,27 +245,144 @@ internal sealed class ChatInspector : IDisposable
         }
         text ??= "";
 
-        string content;
         var label = text.Trim();
         if (label.Length > 0 && name.StartsWith(label, StringComparison.Ordinal))
         {
             // Zoom: the "text" is just the label, and the name is the label followed by the draft.
-            content = name[label.Length..].Trim().TrimEnd(',').Trim();
-            chatKey = label;
-            detail = $"Zoom-style box, draft of {content.Length} char(s)";
-        }
-        else
-        {
-            content = text;
-            chatKey = name;
-            detail = $"text of {content.Length} char(s)";
+            var chatKey = label;
+            // Zoom's composer: the box sits in Zoom's editor ("zm-doc-sdk-editor"), whose lines show the text, and the
+            // Send button is in the container a level or two above that.
+            var ancestors = Ancestors(el, com);
+            int editor = ancestors.FindIndex(a => HasClass(a, "zm-doc-sdk-editor"));
+            bool? caretLineEmpty = editor >= 0 ? CaretLineEmpty(el, ancestors.GetRange(0, editor + 1), com) : null;
+            string line = caretLineEmpty switch { true => ", caret on an empty line", false => ", caret on a line with text", _ => "" };
+            if (editor >= 0 && SendButtonEnabled(ancestors.GetRange(editor + 1, Math.Min(MaxSendButtonLevels, ancestors.Count - editor - 1)), com) is bool sendEnabled)
+            {
+                info = new ChatInfo(chatKey, Live: true, caretLineEmpty);
+                detail = $"Zoom-style box, Send button {(sendEnabled ? "enabled" : "disabled")}{line}";
+                return sendEnabled ? CaretState.ChatNotEmpty : CaretState.ChatEmpty;
+            }
+            var content = name[label.Length..].Trim().TrimEnd(',').Trim();
+            info = new ChatInfo(chatKey, Live: false, caretLineEmpty);
+            detail = $"Zoom-style box, no Send button found, draft of {content.Length} char(s) when opened{line}";
+            return IsBlank(content) ? CaretState.ChatEmpty : CaretState.ChatNotEmpty;
         }
 
-        bool empty = true;
-        foreach (var c in content)
-            if (!char.IsWhiteSpace(c) && !Bidi.IsLineBreak(c)) { empty = false; break; } // a lone mark counts as content
-        return empty ? CaretState.ChatEmpty : CaretState.ChatNotEmpty;
+        // A box that exposes its text: that is up to date.
+        info = new ChatInfo(name, Live: true);
+        detail = $"text of {text.Length} char(s)";
+        return IsBlank(text) ? CaretState.ChatEmpty : CaretState.ChatNotEmpty;
     }
+
+    /// <summary>Only spaces, line breaks and zero-width spaces (Zoom's empty line). A lone mark counts as content.</summary>
+    static bool IsBlank(string s)
+    {
+        foreach (var c in s)
+            if (!char.IsWhiteSpace(c) && !Bidi.IsLineBreak(c) && c != (char)0x200B) return false;
+        return true;
+    }
+
+    const int MaxAncestorLevels = 8;
+    /// <summary>How far above Zoom's editor container the Send button is looked for.</summary>
+    const int MaxSendButtonLevels = 3;
+    // Inspector thread only.
+    IUIAutomationTreeWalker? _walker, _rawWalker;
+    IUIAutomationCondition? _sendButtonCondition;
+
+    /// <summary>The chat box's ancestors, nearest first (up to <see cref="MaxAncestorLevels"/>).</summary>
+    List<IUIAutomationElement> Ancestors(IUIAutomationElement box, List<object> com)
+    {
+        _walker ??= _uia!.get_ControlViewWalker();
+        var list = new List<IUIAutomationElement>(MaxAncestorLevels);
+        var current = box;
+        while (list.Count < MaxAncestorLevels && _walker.GetParentElement(current) is { } parent)
+        {
+            current = Track(com, parent);
+            list.Add(current);
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Is the Send button next to this chat box enabled (the box has content)? Null if there's no such button.
+    /// Zoom's composer puts the box and its Send button in one container, a few levels above the box. Searching
+    /// from the nearest ancestor outwards finds this box's own button (the containers below it are tiny).
+    /// </summary>
+    bool? SendButtonEnabled(IEnumerable<IUIAutomationElement> ancestors, List<object> com)
+    {
+        _sendButtonCondition ??= _uia!.CreateAndCondition(
+            _uia.CreatePropertyCondition(Uia.UIA_ControlTypePropertyId, Uia.UIA_ButtonControlTypeId),
+            _uia.CreatePropertyCondition(Uia.UIA_NamePropertyId, "Send"));
+        foreach (var ancestor in ancestors)
+            if (ancestor.FindFirst(Uia.TreeScope_Descendants, _sendButtonCondition) is { } button)
+                return Track(com, button).GetCurrentPropertyValue(Uia.UIA_IsEnabledPropertyId) is true;
+        return null;
+    }
+
+    /// <summary>
+    /// Is the line the caret is on empty? Zoom's editor shows each line as a "zm-paragraph-block" with its text,
+    /// next to the hidden input box that receives the keys - and that box sits where the caret is, so its height
+    /// tells the line. Null if this can't be worked out (not Zoom's editor, or the caret in a list or quote).
+    /// </summary>
+    bool? CaretLineEmpty(IUIAutomationElement box, List<IUIAutomationElement> ancestors, List<object> com)
+    {
+        if (Rect(box) is not { } caret) return null;
+        double caretY = caret.Top + Math.Min(caret.Height, 24) / 2;
+        // The line elements are plain containers, which aren't in UI Automation's control view (so FindAll doesn't
+        // see them): walk the raw tree.
+        _rawWalker ??= _uia!.get_RawViewWalker();
+
+        for (int level = 0; level < ancestors.Count; level++)
+        {
+            var paragraphs = new List<IUIAutomationElement>();
+            CollectParagraphs(ancestors[level], 0, paragraphs, com);
+            if (paragraphs.Count == 0) continue;
+            foreach (var p in paragraphs)
+                if (Rect(p) is { } r && caretY >= r.Top && caretY < r.Top + r.Height)
+                    return IsBlank(TextOf(p, 0, com));
+            return null; // the editor, but the caret isn't on a plain line
+        }
+        return null;
+    }
+
+    const int MaxEditorDepth = 5, MaxParagraphs = 200;
+
+    static bool HasClass(IUIAutomationElement el, string cls) =>
+        el.GetCurrentPropertyValue(Uia.UIA_ClassNamePropertyId) is string classes
+        && Array.IndexOf(classes.Split(' '), cls) >= 0;
+
+    void CollectParagraphs(IUIAutomationElement el, int depth, List<IUIAutomationElement> found, List<object> com)
+    {
+        if (depth >= MaxEditorDepth) return;
+        for (var c = _rawWalker!.GetFirstChildElement(el); c is not null && found.Count < MaxParagraphs; c = _rawWalker.GetNextSiblingElement(c))
+        {
+            Track(com, c);
+            if (HasClass(c, "zm-paragraph-block")) found.Add(c);
+            else
+                CollectParagraphs(c, depth + 1, found, com);
+        }
+    }
+
+    /// <summary>The text of a line: the names of the text elements in it.</summary>
+    string TextOf(IUIAutomationElement el, int depth, List<object> com)
+    {
+        if (depth >= 3) return "";
+        var sb = new System.Text.StringBuilder();
+        for (var c = _rawWalker!.GetFirstChildElement(el); c is not null; c = _rawWalker.GetNextSiblingElement(c))
+        {
+            Track(com, c);
+            sb.Append(c.get_CurrentControlType() == Uia.UIA_TextControlTypeId ? c.get_CurrentName() : TextOf(c, depth + 1, com));
+        }
+        return sb.ToString();
+    }
+
+    readonly record struct Bounds(double Left, double Top, double Width, double Height);
+
+    static Bounds? Rect(IUIAutomationElement el) =>
+        el.GetCurrentPropertyValue(Uia.UIA_BoundingRectanglePropertyId) is double[] { Length: 4 } r
+        && double.IsFinite(r[1]) && double.IsFinite(r[3]) && r[3] > 0
+            ? new Bounds(r[0], r[1], r[2], r[3])
+            : null;
 
     public void Dispose() => _queue.CompleteAdding();
 }

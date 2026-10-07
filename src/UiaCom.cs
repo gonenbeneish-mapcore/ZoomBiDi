@@ -13,7 +13,15 @@ internal static class Uia
 {
     public const int UIA_ValuePatternId = 10002;
     public const int UIA_TextPatternId = 10014;
+    public const int UIA_BoundingRectanglePropertyId = 30001;
+    public const int UIA_ControlTypePropertyId = 30003;
+    public const int UIA_ClassNamePropertyId = 30012;
+    public const int UIA_TextControlTypeId = 50020;
+    public const int UIA_NamePropertyId = 30005;
+    public const int UIA_IsEnabledPropertyId = 30010;
     public const int UIA_IsPasswordPropertyId = 30019;
+    public const int UIA_ButtonControlTypeId = 50000;
+    public const int TreeScope_Descendants = 0x4;
     public const int UIA_EditControlTypeId = 50004;
     public const int UIA_MenuControlTypeId = 50009;
     public const int UIA_MenuBarControlTypeId = 50010;
@@ -40,6 +48,37 @@ internal interface IUIAutomation
     void _Slot6();  // ElementFromHandle
     void _Slot7();  // ElementFromPoint
     IUIAutomationElement GetFocusedElement(); // 8
+    void _Slot9();  // GetRootElementBuildCache
+    void _Slot10(); // ElementFromHandleBuildCache
+    void _Slot11(); // ElementFromPointBuildCache
+    void _Slot12(); // GetFocusedElementBuildCache
+    void _Slot13(); // CreateTreeWalker
+    IUIAutomationTreeWalker get_ControlViewWalker(); // 14
+    void _Slot15(); // get_ContentViewWalker
+    IUIAutomationTreeWalker get_RawViewWalker(); // 16
+    void _Slot17(); // get_RawViewCondition
+    void _Slot18(); // get_ControlViewCondition
+    void _Slot19(); // get_ContentViewCondition
+    void _Slot20(); // CreateCacheRequest
+    void _Slot21(); // CreateTrueCondition
+    void _Slot22(); // CreateFalseCondition
+    IUIAutomationCondition CreatePropertyCondition(int propertyId, [MarshalAs(UnmanagedType.Struct)] object value); // 23
+    void _Slot24(); // CreatePropertyConditionEx
+    IUIAutomationCondition CreateAndCondition(IUIAutomationCondition condition1, IUIAutomationCondition condition2); // 25
+}
+
+[ComImport, Guid("352ffba8-0973-437c-a61f-f64cafd81df9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IUIAutomationCondition
+{
+}
+
+[ComImport, Guid("4042c624-389c-4afc-a630-9df854a541fc"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IUIAutomationTreeWalker
+{
+    IUIAutomationElement? GetParentElement(IUIAutomationElement element); // 3
+    IUIAutomationElement? GetFirstChildElement(IUIAutomationElement element); // 4
+    void _Slot5();  // GetLastChildElement
+    IUIAutomationElement? GetNextSiblingElement(IUIAutomationElement element); // 6
 }
 
 [ComImport, Guid("d22108aa-8ac5-49a5-837b-37bbb3d7591e"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -47,7 +86,7 @@ internal interface IUIAutomationElement
 {
     void _Slot3();  // SetFocus
     void _Slot4();  // GetRuntimeId
-    void _Slot5();  // FindFirst
+    IUIAutomationElement? FindFirst(int scope, IUIAutomationCondition condition); // 5
     void _Slot6();  // FindAll
     void _Slot7();  // FindFirstBuildCache
     void _Slot8();  // FindAllBuildCache

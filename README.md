@@ -28,7 +28,7 @@ way the line goes. ZoomBiDi does that for you automatically:
   right-to-left, and lines that start in English stay left-to-right (`hello שלום` stays `hello שלום`).
 * Search boxes and other fields in Zoom aren't touched. Outside Zoom it does nothing at all.
 * It's light: about 3 MB of memory while you're in other apps, about 12–17 MB while Zoom is in front, and no
-  CPU at all outside Zoom. The first character of a line is held for a few milliseconds (median 6 ms); the rest
+  CPU at all outside Zoom. The first character of a line is held for a few milliseconds (10–20 ms); the rest
   of your typing passes straight through.
 * It works with a Zoom that's already running; there's no need to restart Zoom.
 
@@ -79,10 +79,15 @@ Backspace, arrows…).
     letter (then Enter picks from Zoom's mention or emoji list);
   * after the message is sent (Ctrl+Enter or Enter, whichever Zoom's box label says sends), after Ctrl+A
     (followed by typing, Delete or Backspace), or when Backspace removed the mark of the box's only line;
-  * when the user arrives in a chat (click, window switch, Tab, Zoom's chat-switching keys) whose box Zoom
-    reports as empty, and which hasn't been typed into since it was last sent. Zoom's accessible name for the
-    box is the label followed by the draft, but only as it was when the chat was opened, so it's trusted only
-    for chats ZoomBiDi hasn't seen typing in.
+  * when the user arrives in the box (click, window switch, Tab, Zoom's chat-switching keys) and the caret is on
+    an empty line, or the box is empty. The box ZoomBiDi sees is a small hidden input that Zoom's editor keeps
+    where the caret is. Next to it, the editor shows each line (`zm-paragraph-block`) with its text, live, so the
+    line at the caret's height can be checked for text. These line elements aren't in UI Automation's control
+    view, so they are found by walking the raw tree. Zoom's Send button is disabled exactly while the box is
+    empty, so it tells whether the whole box is empty.
+    Without those (another app, or a different Zoom layout), the box's accessible name is used: the label
+    followed by the draft, but only as it was when the chat was opened. So it's trusted only for chats ZoomBiDi
+    hasn't seen typing in.
 
   Everything else (Backspace, Delete, arrows, Home/End, other shortcuts) never adds a mark.
 * **Cheap by default.** Ordinary typing passes straight through. Only the first character of a line as defined
@@ -90,7 +95,7 @@ Backspace, arrows…).
   focus is a Zoom message box: an Edit control named "Message to …", belonging to Zoom or to a child process of
   Zoom (the chat is an embedded WebView2, so the box lives in `msedgewebview2.exe`).
 * **Replay in order.** The held keys are then replayed with `SendInput`, with U+2068 in front when needed.
-  A typical check takes about 5 ms.
+  A check takes about 5 ms, or 10–20 ms in Zoom, where the line under the caret is looked at too.
 * **Backspace over the mark.** After inserting a mark, ZoomBiDi counts the characters typed and deleted on that
   line. When a plain Backspace would delete only the invisible mark (so nothing would visibly happen), it sends
   one more Backspace: one press then joins an otherwise empty line with the line above, or empties the box.
@@ -164,7 +169,8 @@ types 31 cases into it (Hebrew, English and mixed lines, multiple lines, Backspa
 mid-line, Home, arrows, selections, Enter picking a mention, Alt taps, and "bursts" sent in one go so that keys
 arrive while a check is running) and checks exactly where U+2068 ended up, using an exact comparison
 (culture-aware string comparison ignores invisible characters). Unlike Zoom, the test page exposes its text, so
-"is the box empty" is always accurate there; the key-based line tracking is the same.
+"is the box empty" is always accurate there; the key-based line tracking is the same. Clicking onto an empty line
+is specific to Zoom's editor, so it was tested in Zoom itself.
 
 | Option | Effect |
 |---|---|
@@ -194,9 +200,9 @@ anywhere else. The Hebrew and English (US) keyboard layouts must both be install
   happens without ZoomBiDi too): Zoom's editor has no right-to-left support, and no invisible character changes
   it. 16 combinations were tested in Zoom. For the same reason ZoomBiDi doesn't right-align Hebrew lines (Zoom's
   Ctrl+Shift+R would do it, but the caret stays on the wrong side).
-* Because Zoom hides its caret, a line only gets the mark where the keys show it starts (see "How it works").
-  Clicking or pressing Home at the start of a line that already has text and typing there adds no mark. The same
-  goes for returning to a chat whose draft you emptied with Backspace (rather than sending it or Ctrl+A).
+* A line only gets the mark where it's known to start (see "How it works"). Clicking or pressing Home at the
+  start of a line that already has text and typing there adds no mark. Neither does deleting a line's text
+  with Backspace and retyping it without clicking away first.
 * The chat inside a Zoom *meeting* hasn't been tested and may name its text box differently. If it's ignored
   there, the debug log shows the name, and `ChatNamePattern` can be widened.
 * Enter right after a word starting with `@`, or with `:` and a letter (`:smile`), is assumed to pick a mention
