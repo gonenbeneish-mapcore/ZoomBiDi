@@ -28,8 +28,8 @@ way the line goes. ZoomBiDi does that for you automatically:
   right-to-left, and lines that start in English stay left-to-right (`hello שלום` stays `hello שלום`).
 * Search boxes and other fields in Zoom aren't touched. Outside Zoom it does nothing at all.
 * It's light: about 3 MB of memory while you're in other apps, about 12–17 MB while Zoom is in front, and no
-  CPU at all outside Zoom. The first character of a line is held for a few milliseconds (10–20 ms); the rest
-  of your typing passes straight through.
+  CPU at all outside Zoom. The first character of a line is held for a few milliseconds (about 5 ms, or 20 ms
+  after a click); the rest of your typing passes straight through.
 * It works with a Zoom that's already running; there's no need to restart Zoom.
 
 You just type as usual.
@@ -95,7 +95,8 @@ Backspace, arrows…).
   focus is a Zoom message box: an Edit control named "Message to …", belonging to Zoom or to a child process of
   Zoom (the chat is an embedded WebView2, so the box lives in `msedgewebview2.exe`).
 * **Replay in order.** The held keys are then replayed with `SendInput`, with U+2068 in front when needed.
-  A check takes about 5 ms, or 10–20 ms in Zoom, where the line under the caret is looked at too.
+  A check takes about 5 ms; after a click or window switch about 20 ms, because the line under the caret and
+  the Send button are looked at too.
 * **Backspace over the mark.** After inserting a mark, ZoomBiDi counts the characters typed and deleted on that
   line. When a plain Backspace would delete only the invisible mark (so nothing would visibly happen), it sends
   one more Backspace: one press then joins an otherwise empty line with the line above, or empties the box.

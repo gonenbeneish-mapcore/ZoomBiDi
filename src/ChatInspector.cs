@@ -32,7 +32,7 @@ internal enum CaretState
 /// </summary>
 internal sealed class ChatInspector : IDisposable
 {
-    sealed record Request(uint ProcessId, int Id, bool MayUseLastChat, int SettleMs,
+    sealed record Request(uint ProcessId, int Id, bool MayUseLastChat, bool Arrival, int SettleMs,
         Action<int, CaretState>? Callback, long Created);
 
     const int MaxTransientRetries = 4;
@@ -74,14 +74,18 @@ internal sealed class ChatInspector : IDisposable
     /// Nothing that could move focus (click, Tab, window switch) happened since the last check, so if focus is
     /// momentarily on Zoom's menu bar the chat box from the last check can be asked instead.
     /// </param>
+    /// <param name="arrival">
+    /// The user may have just arrived in the box (click, window switch): also find out whether the box and the line
+    /// the caret is on are empty. (After Enter and the like, the keys already say that a line starts.)
+    /// </param>
     /// <param name="settleMs">
     /// Wait this long first: keys we just replayed have passed our hook but Zoom may not have processed them yet.
     /// </param>
-    public void Query(uint processId, int id, bool mayUseLastChat, int settleMs, Action<int, CaretState> callback) =>
-        _queue.Add(new Request(processId, id, mayUseLastChat, settleMs, callback, Environment.TickCount64));
+    public void Query(uint processId, int id, bool mayUseLastChat, bool arrival, int settleMs, Action<int, CaretState> callback) =>
+        _queue.Add(new Request(processId, id, mayUseLastChat, arrival, settleMs, callback, Environment.TickCount64));
 
     /// <summary>Warms up the UIA connection (the first call into a Chromium-based window is slow).</summary>
-    public void Prime(uint processId) => _queue.Add(new Request(processId, 0, false, 0, null, Environment.TickCount64));
+    public void Prime(uint processId) => _queue.Add(new Request(processId, 0, false, false, 0, null, Environment.TickCount64));
 
     void Worker()
     {
@@ -103,7 +107,7 @@ internal sealed class ChatInspector : IDisposable
                 try
                 {
                     _uia ??= (IUIAutomation)new CUIAutomation();
-                    result = Inspect(req.ProcessId, req.MayUseLastChat, com, out detail, out transient, out chatInfo);
+                    result = Inspect(req.ProcessId, req.MayUseLastChat, req.Arrival, com, out detail, out transient, out chatInfo);
                 }
                 catch (Exception ex)
                 {
@@ -140,7 +144,7 @@ internal sealed class ChatInspector : IDisposable
     /// True when focus isn't on any text box at all (menu bar, window, other process) - typically a passing state,
     /// worth asking again. False for a definite answer, including "a text box, but not a chat box".
     /// </param>
-    CaretState Inspect(uint processId, bool mayUseLastChat, List<object> com, out string detail, out bool transient,
+    CaretState Inspect(uint processId, bool mayUseLastChat, bool arrival, List<object> com, out string detail, out bool transient,
         out ChatInfo? chatKey)
     {
         transient = true;
@@ -184,7 +188,7 @@ internal sealed class ChatInspector : IDisposable
         }
 
         RememberChat(el, processId, com);
-        return EvaluateChat(el, name, com, out detail, out chatKey);
+        return EvaluateChat(el, name, arrival, com, out detail, out chatKey);
     }
 
     // The chat box from the last successful check (inspector thread only).
@@ -212,7 +216,7 @@ internal sealed class ChatInspector : IDisposable
         if (_lastChat is null || _lastChatOwner != processId) { detail = why; return CaretState.NotChat; }
         try
         {
-            var state = EvaluateChat(_lastChat, _lastChat.get_CurrentName() ?? "", com, out var d, out chatKey);
+            var state = EvaluateChat(_lastChat, _lastChat.get_CurrentName() ?? "", false, com, out var d, out chatKey);
             transient = false;
             detail = $"{why}; used the chat box from the last check: {d}";
             return state;
@@ -230,7 +234,7 @@ internal sealed class ChatInspector : IDisposable
     /// for Zoom's box this comes from the name (label + the draft as it was when the chat was opened - it isn't
     /// updated while typing), so the hook only trusts it when the user just arrived in a chat not typed into yet.
     /// </summary>
-    CaretState EvaluateChat(IUIAutomationElement el, string name, List<object> com, out string detail, out ChatInfo? info)
+    CaretState EvaluateChat(IUIAutomationElement el, string name, bool arrival, List<object> com, out string detail, out ChatInfo? info)
     {
         string? text = null;
         if (el.GetCurrentPattern(Uia.UIA_TextPatternId) is IUIAutomationTextPattern tp)
@@ -250,21 +254,39 @@ internal sealed class ChatInspector : IDisposable
         {
             // Zoom: the "text" is just the label, and the name is the label followed by the draft.
             var chatKey = label;
-            // Zoom's composer: the box sits in Zoom's editor ("zm-doc-sdk-editor"), whose lines show the text, and the
-            // Send button is in the container a level or two above that.
-            var ancestors = Ancestors(el, com);
-            int editor = ancestors.FindIndex(a => HasClass(a, "zm-doc-sdk-editor"));
-            bool? caretLineEmpty = editor >= 0 ? CaretLineEmpty(el, ancestors.GetRange(0, editor + 1), com) : null;
-            string line = caretLineEmpty switch { true => ", caret on an empty line", false => ", caret on a line with text", _ => "" };
-            if (editor >= 0 && SendButtonEnabled(ancestors.GetRange(editor + 1, Math.Min(MaxSendButtonLevels, ancestors.Count - editor - 1)), com) is bool sendEnabled)
+            bool? caretLineEmpty = null, sendEnabled = null;
+            string extra = "";
+            if (arrival)
+            {
+                // Zoom's composer: the box sits in Zoom's editor ("zm-doc-sdk-editor"), whose lines show the text, and
+                // the Send button is in the container a level or two above that. Extra information only: if Zoom is
+                // redrawing and this fails, the check still stands.
+                try
+                {
+                    var ancestors = Ancestors(el, com);
+                    int editor = ancestors.FindIndex(a => HasClass(a, "zm-doc-sdk-editor"));
+                    if (editor >= 0)
+                    {
+                        caretLineEmpty = CaretLineEmpty(el, ancestors.GetRange(0, editor + 1), com);
+                        sendEnabled = SendButtonEnabled(
+                            ancestors.GetRange(editor + 1, Math.Min(MaxSendButtonLevels, ancestors.Count - editor - 1)), com);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    extra = $", editor not readable ({ex.GetType().Name})";
+                }
+                extra += caretLineEmpty switch { true => ", caret on an empty line", false => ", caret on a line with text", _ => "" };
+            }
+            if (sendEnabled is bool enabled)
             {
                 info = new ChatInfo(chatKey, Live: true, caretLineEmpty);
-                detail = $"Zoom-style box, Send button {(sendEnabled ? "enabled" : "disabled")}{line}";
-                return sendEnabled ? CaretState.ChatNotEmpty : CaretState.ChatEmpty;
+                detail = $"Zoom-style box, Send button {(enabled ? "enabled" : "disabled")}{extra}";
+                return enabled ? CaretState.ChatNotEmpty : CaretState.ChatEmpty;
             }
             var content = name[label.Length..].Trim().TrimEnd(',').Trim();
             info = new ChatInfo(chatKey, Live: false, caretLineEmpty);
-            detail = $"Zoom-style box, no Send button found, draft of {content.Length} char(s) when opened{line}";
+            detail = $"Zoom-style box, draft of {content.Length} char(s) when opened{extra}";
             return IsBlank(content) ? CaretState.ChatEmpty : CaretState.ChatNotEmpty;
         }
 

@@ -45,6 +45,8 @@ internal sealed class KeyboardMonitor : IDisposable
     /// them (and updates what UI Automation reports) a little later.
     /// </summary>
     const int BacklogSettleMs = 40;
+    /// <summary>A line's first character this soon after a click waits until the click has had its effect.</summary>
+    const int ClickSettleMs = 50;
     const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75, VK_ESCAPE = 0x1B, VK_A = 0x41, VK_DELETE = 0x2E;
     const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_UP = 0x26, VK_DOWN = 0x28, VK_L = 0x4C, VK_N = 0x4E, VK_W = 0x57;
     const uint GUI_INMENUMODE = 0x4, GUI_SYSTEMMENUMODE = 0x8, GUI_POPUPMENUMODE = 0x10;
@@ -132,6 +134,8 @@ internal sealed class KeyboardMonitor : IDisposable
     int _charsAfterMark;
     /// <summary>Focus may have left the chat box since the last check (click, Tab, window switch).</summary>
     bool _focusMayHaveMoved = true;
+    /// <summary>When the last mouse click happened (Environment.TickCount64).</summary>
+    long _lastClick;
     bool _enabled;
     bool _zoomInForeground;
     Phase _phase = Phase.Normal;
@@ -327,6 +331,7 @@ internal sealed class KeyboardMonitor : IDisposable
             int m = (int)wParam;
             if (m is WM_LBUTTONDOWN or WM_RBUTTONDOWN or WM_MBUTTONDOWN or WM_XBUTTONDOWN)
             {
+                _lastClick = Environment.TickCount64;
                 _dirty = true; // a click may have moved the caret or switched chats
                 FocusMayHaveMoved();
             }
@@ -573,13 +578,16 @@ internal sealed class KeyboardMonitor : IDisposable
         _phase = Phase.Checking;
         int id = ++_checkId;
         bool mayUseLastChat = !_focusMayHaveMoved;
+        // Right after a click, Zoom may not have moved its caret (and the hidden box that shows where it is) yet.
+        long sinceClick = Environment.TickCount64 - _lastClick;
+        if (_checkFocusArrival && sinceClick < ClickSettleMs) settleMs = Math.Max(settleMs, ClickSettleMs - (int)sinceClick);
         _focusMayHaveMoved = false;
         _checkClock.Restart();
         if (_log.Enabled)
             _log.Info($"'{first.Char}' U+{(int)first.Char:X4}: checking (#{id})" +
                 $"{(_checkLineStart ? _checkEmptyBox ? ", box emptied" : ", new line" : "")}{(_checkFocusArrival ? ", focus may have moved" : "")}");
         uint hookThread = _threadId;
-        _inspector.Query(pid, id, mayUseLastChat, settleMs,
+        _inspector.Query(pid, id, mayUseLastChat, arrival: _checkFocusArrival, settleMs,
             (rid, state) => PostThreadMessage(hookThread, WM_APP_CHECK_RESULT, rid, (int)state));
         uint timeout = _settings.UiaTimeoutMs > 0 ? (uint)_settings.UiaTimeoutMs : CheckTimeoutMsDefault;
         StartTimer(ref _timer, timeout + (uint)settleMs);
