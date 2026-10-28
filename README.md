@@ -132,7 +132,7 @@ the Explorer address bar. Restart ZoomBiDi after editing.
 | `Enabled` | `true` | Same as the tray toggle |
 | `MarkerHex` | `2068` | Code point to insert. `2068` (FSI) follows each line's first letter. Up to 1.2 the default was `2067` (RLI, always right-to-left); settings files still holding `2067` are upgraded automatically, so write `U+2067` to keep it on purpose |
 | `ProcessNames` | `["Zoom"]` | Processes (without `.exe`) treated as Zoom |
-| `ChatNamePattern` | `message\|reply` | Regex matched (case-insensitive) against the focused box's accessible name. Up to 1.2 the default was `message`, which missed the reply box under a thread; settings files still holding `message` are upgraded automatically |
+| `ChatNamePattern` | `message\|reply` | Regex matched (case-insensitive) against the focused box's accessible name. Up to 1.3.0 the default was `message`, which missed the reply box under a thread; settings files still holding `message` are upgraded automatically |
 | `UiaTimeoutMs` | `250` | Give up and type without the mark if the check takes longer |
 | `DebugLog` | `false` | Write decisions to `%APPDATA%\ZoomBiDi\log.txt` |
 | `ProcessInjectedInput` | `false` | Testing only: also react to synthetic keystrokes |

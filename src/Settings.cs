@@ -30,7 +30,7 @@ internal sealed class Settings
     /// </summary>
     public string ChatNamePattern { get; set; } = "message|reply";
 
-    /// <summary>The default before 1.3, which missed reply boxes; a settings file still holding it is upgraded.</summary>
+    /// <summary>The default before 1.3.1, which missed reply boxes; a settings file still holding it is upgraded.</summary>
     const string OldDefaultChatNamePattern = "message";
 
     /// <summary>Maximum time to wait for UI Automation when deciding whether to insert.</summary>
