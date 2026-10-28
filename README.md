@@ -92,8 +92,8 @@ Backspace, arrows…).
   Everything else (Backspace, Delete, arrows, Home/End, other shortcuts) never adds a mark.
 * **Cheap by default.** Ordinary typing passes straight through. Only the first character of a line as defined
   above is held, while UI Automation confirms (on a separate MTA thread, through the COM API directly) that the
-  focus is a Zoom message box: an Edit control named "Message to …", belonging to Zoom or to a child process of
-  Zoom (the chat is an embedded WebView2, so the box lives in `msedgewebview2.exe`).
+  focus is a Zoom message box: an Edit control named "Message to …" (or "Reply to …" in a thread), belonging to
+  Zoom or to a child process of Zoom (the chat is an embedded WebView2, so the box lives in `msedgewebview2.exe`).
 * **Replay in order.** The held keys are then replayed with `SendInput`, with U+2068 in front when needed.
   A check takes about 5 ms; after a click or window switch about 20 ms, because the line under the caret and
   the Send button are looked at too.
@@ -132,7 +132,7 @@ the Explorer address bar. Restart ZoomBiDi after editing.
 | `Enabled` | `true` | Same as the tray toggle |
 | `MarkerHex` | `2068` | Code point to insert. `2068` (FSI) follows each line's first letter. Up to 1.2 the default was `2067` (RLI, always right-to-left); settings files still holding `2067` are upgraded automatically, so write `U+2067` to keep it on purpose |
 | `ProcessNames` | `["Zoom"]` | Processes (without `.exe`) treated as Zoom |
-| `ChatNamePattern` | `message` | Regex matched (case-insensitive) against the focused box's accessible name |
+| `ChatNamePattern` | `message\|reply` | Regex matched (case-insensitive) against the focused box's accessible name. Up to 1.2 the default was `message`, which missed the reply box under a thread; settings files still holding `message` are upgraded automatically |
 | `UiaTimeoutMs` | `250` | Give up and type without the mark if the check takes longer |
 | `DebugLog` | `false` | Write decisions to `%APPDATA%\ZoomBiDi\log.txt` |
 | `ProcessInjectedInput` | `false` | Testing only: also react to synthetic keystrokes |

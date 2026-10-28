@@ -25,9 +25,13 @@ internal sealed class Settings
 
     /// <summary>
     /// Regex matched (case-insensitive) against the accessible name of the focused text box.
-    /// Zoom names its chat input "Message to &lt;chat&gt;, ..." – this keeps the marker out of search boxes etc.
+    /// Zoom names its chat input "Message to &lt;chat&gt;, ..." and the box under a thread "Reply to &lt;name&gt;, ..."
+    /// – this keeps the marker out of search boxes etc.
     /// </summary>
-    public string ChatNamePattern { get; set; } = "message";
+    public string ChatNamePattern { get; set; } = "message|reply";
+
+    /// <summary>The default before 1.3, which missed reply boxes; a settings file still holding it is upgraded.</summary>
+    const string OldDefaultChatNamePattern = "message";
 
     /// <summary>Maximum time to wait for UI Automation when deciding whether to insert.</summary>
     public int UiaTimeoutMs { get; set; } = 250;
@@ -75,10 +79,21 @@ internal sealed class Settings
         {
             s.Save();
         }
-        else if (string.Equals(s.MarkerHex?.Trim(), OldDefaultMarkerHex, StringComparison.Ordinal))
+        else
         {
-            s.MarkerHex = new Settings().MarkerHex; // old default: move to the new one
-            s.Save();
+            // Old defaults: move to the new ones.
+            bool upgraded = false;
+            if (string.Equals(s.MarkerHex?.Trim(), OldDefaultMarkerHex, StringComparison.Ordinal))
+            {
+                s.MarkerHex = new Settings().MarkerHex;
+                upgraded = true;
+            }
+            if (string.Equals(s.ChatNamePattern?.Trim(), OldDefaultChatNamePattern, StringComparison.OrdinalIgnoreCase))
+            {
+                s.ChatNamePattern = new Settings().ChatNamePattern;
+                upgraded = true;
+            }
+            if (upgraded) s.Save();
         }
         return s;
     }
