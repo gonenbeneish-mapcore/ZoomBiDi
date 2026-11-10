@@ -59,7 +59,7 @@ Just chat in Zoom. Tray icon controls:
 
 **Privacy:** ZoomBiDi never connects to the network and never stores what you type. The optional debug log (off
 by default) records only the first character of each new line, and the key codes of non-character keys (Enter,
-Backspace, arrows…).
+Backspace, arrows…). When you paste into Zoom, the clipboard's text is scanned for direction marks and not kept.
 
 ---
 
@@ -101,6 +101,11 @@ Backspace, arrows…).
   line. When a plain Backspace would delete only the invisible mark (so nothing would visibly happen), it sends
   one more Backspace: one press then joins an otherwise empty line with the line above, or empties the box.
   Counting stops at anything that may move the caret, and Backspace is then left alone.
+* **Typing after a paste.** Text copied from a chat can carry a direction mark that is never closed (for
+  example `word` followed by U+2067); whatever is typed after it would take that mark's direction. On Ctrl+V,
+  Ctrl+Shift+V or Shift+Insert the clipboard's text is scanned (off the hook thread) for isolates and embeddings
+  left open on its last line. If there are any, the first character typed right after the paste, in a chat box,
+  is preceded by the characters that close them (U+2069, U+202C). Moving the caret first cancels this.
 * **Keys typed during a check.** They're held too, and each is classified as it arrives, using the modifier
   state the held keys themselves produce (so a held Ctrl+V is still seen as a shortcut). If they include a new
   line (e.g. a fast Enter and the next line's first letter), everything up to that point is replayed, and the
@@ -196,7 +201,9 @@ anywhere else. The Hebrew and English (US) keyboard layouts must both be install
 
 ### Known limitations
 
-* Only typed text is handled. Pasted text doesn't get the marker.
+* Only typed text is handled. Pasted text doesn't get the marker, and a direction mark it leaves open is only
+  closed when you type right after pasting with the keyboard (not after a right-click → Paste, or after moving
+  the caret).
 * The caret sits at the right of a Hebrew line instead of after the last word. That's Zoom's own behaviour (it
   happens without ZoomBiDi too): Zoom's editor has no right-to-left support, and no invisible character changes
   it. 16 combinations were tested in Zoom. For the same reason ZoomBiDi doesn't right-align Hebrew lines (Zoom's

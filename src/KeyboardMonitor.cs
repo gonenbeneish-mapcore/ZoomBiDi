@@ -49,6 +49,9 @@ internal sealed class KeyboardMonitor : IDisposable
     const int ClickSettleMs = 50;
     const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75, VK_ESCAPE = 0x1B, VK_A = 0x41, VK_DELETE = 0x2E;
     const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_UP = 0x26, VK_DOWN = 0x28, VK_L = 0x4C, VK_N = 0x4E, VK_W = 0x57;
+    const int VK_V = 0x56, VK_INSERT = 0x2D;
+    /// <summary>Longer clipboard text than this isn't looked at.</summary>
+    const int MaxPasteChars = 1 << 20;
     const uint GUI_INMENUMODE = 0x4, GUI_SYSTEMMENUMODE = 0x8, GUI_POPUPMENUMODE = 0x10;
 
     enum Phase
@@ -79,8 +82,9 @@ internal sealed class KeyboardMonitor : IDisposable
     /// <param name="PlainDelete">Delete without Ctrl/Alt/Win.</param>
     /// <param name="CtrlEnter">Ctrl+Enter (sends, in Zoom's default setting).</param>
     /// <param name="PlainEnter">Enter alone (sends, if Zoom is set to "Enter to send").</param>
+    /// <param name="Paste">Ctrl+V, Ctrl+Shift+V or Shift+Insert.</param>
     readonly record struct HeldKey(KBDLLHOOKSTRUCT Data, bool Up, KeyKind Kind, char Char, bool NewLine, bool SelectAll,
-        bool FocusMove, bool PlainBackspace = false, bool PlainDelete = false, bool CtrlEnter = false, bool PlainEnter = false);
+        bool FocusMove, bool PlainBackspace = false, bool PlainDelete = false, bool CtrlEnter = false, bool PlainEnter = false, bool Paste = false);
 
     [Flags]
     enum Mods { None = 0, Shift = 1, Ctrl = 2, Alt = 4, Win = 8 }
@@ -132,6 +136,15 @@ internal sealed class KeyboardMonitor : IDisposable
     /// </summary>
     bool _markOnLine;
     int _charsAfterMark;
+    /// <summary>
+    /// The last caret-moving key was a paste (its number, or 0): the caret is right after the pasted text. If that
+    /// text leaves an isolate or embedding open, the next character typed is preceded by the characters closing it.
+    /// </summary>
+    int _pendingPaste;
+    int _pasteCount;
+    /// <summary>What the clipboard held at paste number Paste: the closing characters it needs (set by a pool thread).</summary>
+    sealed record PasteScan(int Paste, string Closers);
+    volatile PasteScan? _pasteScan;
     /// <summary>Focus may have left the chat box since the last check (click, Tab, window switch).</summary>
     bool _focusMayHaveMoved = true;
     /// <summary>When the last mouse click happened (Environment.TickCount64).</summary>
@@ -306,6 +319,7 @@ internal sealed class KeyboardMonitor : IDisposable
         _currentChatKey = null;
         _lineStartPending = _lineStartEmptyBox = _lastWasSelectAll = false;
         _markOnLine = false;
+        _pendingPaste = 0;
         _word.Clear();
     }
 
@@ -424,6 +438,14 @@ internal sealed class KeyboardMonitor : IDisposable
         if (!_dirty || !(_lineStartPending || _focusMayHaveMoved))
         {
             _dirty = false;
+            if (_currentChatKey is not null && PasteClosers(take: false) is not null)
+            {
+                // Typing right after a paste that left a direction mark open: close it first.
+                _held.Add(key);
+                _heldMods = PhysicalMods();
+                Replay(insertMarker: false, keepFrom: 1, closePaste: true);
+                return true;
+            }
             Typed();
             return false;
         }
@@ -437,6 +459,7 @@ internal sealed class KeyboardMonitor : IDisposable
     /// <summary>A character went into the box (passed through or replayed).</summary>
     void Typed()
     {
+        _pendingPaste = 0;
         _lastWasSelectAll = false; // Ctrl+A, then typing: the selection is gone, a later Backspace is just a Backspace
         if (_markOnLine) _charsAfterMark++;
         if (_currentChatKey is not null && _typedChats.Count < 1000) _typedChats.Add(_currentChatKey);
@@ -459,11 +482,13 @@ internal sealed class KeyboardMonitor : IDisposable
     void MarkDirty(HeldKey key)
     {
         _dirty = true;
+        _pendingPaste = 0;
         if (key.FocusMove)
         {
             FocusMayHaveMoved();
             return;
         }
+        if (key.Paste) ScanPaste();
 
         bool sends = Sends(key);
         bool emptiedAll = _lastWasSelectAll && (key.PlainBackspace || key.PlainDelete); // Ctrl+A, then Delete
@@ -481,6 +506,42 @@ internal sealed class KeyboardMonitor : IDisposable
         }
         _lineStartPending = key.NewLine;
         _lineStartEmptyBox = false;
+    }
+
+    /// <summary>
+    /// A paste is on its way to the box: find out (off the hook thread - the clipboard can be slow) whether the
+    /// clipboard's text leaves a direction mark open. The text itself isn't kept.
+    /// </summary>
+    void ScanPaste()
+    {
+        int paste = _pendingPaste = ++_pasteCount;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string closers = "";
+            try
+            {
+                closers = Bidi.Closers(ReadClipboardText(MaxPasteChars));
+            }
+            catch (Exception ex)
+            {
+                _log.Error("clipboard", ex);
+            }
+            lock (_held)
+            {
+                if (_pasteScan is null || _pasteScan.Paste < paste) _pasteScan = new PasteScan(paste, closers);
+            }
+        });
+    }
+
+    /// <summary>
+    /// The characters closing what the text just pasted left open, if the caret is still right after it; else null.
+    /// </summary>
+    string? PasteClosers(bool take)
+    {
+        int paste = _pendingPaste;
+        if (take) _pendingPaste = 0;
+        var scan = _pasteScan;
+        return paste != 0 && scan is not null && scan.Paste == paste && scan.Closers.Length > 0 ? scan.Closers : null;
     }
 
     /// <summary>
@@ -571,7 +632,8 @@ internal sealed class KeyboardMonitor : IDisposable
         // typed a direction mark themselves, the line is left alone.
         if (!(_checkLineStart || _checkFocusArrival) || Bidi.IsDirectionMark(first.Char))
         {
-            Replay(insertMarker: false, keepFrom: FirstAfterDirty(start: 1));
+            Replay(insertMarker: false, keepFrom: FirstAfterDirty(start: 1),
+                closePaste: _currentChatKey is not null && !Bidi.IsDirectionMark(first.Char));
             return;
         }
 
@@ -626,7 +688,7 @@ internal sealed class KeyboardMonitor : IDisposable
         if (_log.Enabled)
             _log.Info($"check #{id} -> {state} after {_checkClock.ElapsedMilliseconds} ms, {(insert ? "inserting marker" : "no marker")}" +
                 $", replaying {keepFrom} key event(s){(keepFrom < _held.Count ? $", {_held.Count - keepFrom} more to examine" : "")}");
-        Replay(insert, keepFrom);
+        Replay(insert, keepFrom, closePaste: chat);
     }
 
     /// <summary>Index of the first printable key-down that follows a caret-moving key, at or after <paramref name="start"/>.</summary>
@@ -727,7 +789,11 @@ internal sealed class KeyboardMonitor : IDisposable
     /// Sends _held[0..keepFrom) (with the marker in front, if asked) and keeps _held[keepFrom..]
     /// (plus <paramref name="extra"/>) held.
     /// </summary>
-    void Replay(bool insertMarker, int keepFrom, HeldKey[]? extra = null)
+    /// <param name="closePaste">
+    /// _held[0] is a character going into a chat box: if it follows a paste that left a direction mark open, close
+    /// that first.
+    /// </param>
+    void Replay(bool insertMarker, int keepFrom, HeldKey[]? extra = null, bool closePaste = false)
     {
         keepFrom = Math.Clamp(keepFrom, 0, _held.Count);
         var send = _held.GetRange(0, keepFrom).ToArray();
@@ -735,6 +801,10 @@ internal sealed class KeyboardMonitor : IDisposable
         if (extra is not null) keep.AddRange(extra);
         _held.Clear();
         _held.AddRange(keep);
+
+        // Before the keys are applied below: a character typed ends the paste, and a paste among them starts another.
+        string? closers = keepFrom > 0 && closePaste ? PasteClosers(take: true) : null;
+        if (closers is not null) _log.Info($"the pasted text left {closers.Length} direction mark(s) open: closing");
 
         // Caret-moving keys among what's sent (e.g. a fast Enter after the first letter) start a new line or
         // move the caret: the next character must be checked again.
@@ -744,7 +814,7 @@ internal sealed class KeyboardMonitor : IDisposable
             else if (h.Kind == KeyKind.Printable) Typed();
         }
 
-        var inputs = BuildInputs(insertMarker, send, endTag: true);
+        var inputs = BuildInputs(insertMarker, send, endTag: true, closers);
         _phase = Phase.Draining;
         if (inputs.Length > 0 && Send(inputs))
         {
@@ -758,9 +828,14 @@ internal sealed class KeyboardMonitor : IDisposable
         }
     }
 
-    INPUT[] BuildInputs(bool insertMarker, HeldKey[] keys, bool endTag)
+    INPUT[] BuildInputs(bool insertMarker, HeldKey[] keys, bool endTag, string? closers = null)
     {
         var list = new List<INPUT>(keys.Length + 2);
+        foreach (char c in closers ?? "")
+        {
+            list.Add(UnicodeKey(c, keyUp: false));
+            list.Add(UnicodeKey(c, keyUp: true));
+        }
         if (insertMarker)
         {
             var marker = _settings.MarkerChar;
@@ -826,7 +901,8 @@ internal sealed class KeyboardMonitor : IDisposable
             PlainBackspace: k.vkCode == VK_BACK && plain,
             PlainDelete: k.vkCode == VK_DELETE && plain,
             CtrlEnter: k.vkCode == VK_RETURN && ctrl && !alt && !win,
-            PlainEnter: k.vkCode == VK_RETURN && plain && !shift);
+            PlainEnter: k.vkCode == VK_RETURN && plain && !shift,
+            Paste: k.vkCode == VK_V && ctrl && !alt && !win || k.vkCode == VK_INSERT && plain && shift);
         if (win || ctrl != alt) return flags; // shortcut (Ctrl+V, Ctrl+Z, Ctrl+Enter, Alt+Tab, ...)
 
         char? ch = Translate(k, threadId, shift, altGr);

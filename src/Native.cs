@@ -198,5 +198,65 @@ internal static class Native
     [DllImport("user32.dll")]
     public static extern uint MapVirtualKey(uint uCode, uint uMapType);
 
+    const uint CF_UNICODETEXT = 13;
+
+    [DllImport("user32.dll")]
+    static extern bool IsClipboardFormatAvailable(uint format);
+
+    [DllImport("user32.dll")]
+    static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [DllImport("user32.dll")]
+    static extern bool CloseClipboard();
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetClipboardData(uint uFormat);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [DllImport("kernel32.dll")]
+    static extern bool GlobalUnlock(IntPtr hMem);
+
+    [DllImport("kernel32.dll")]
+    static extern UIntPtr GlobalSize(IntPtr hMem);
+
+    /// <summary>
+    /// The clipboard's text, or null if there is none, it is longer than <paramref name="maxChars"/>, or the
+    /// clipboard is busy. May wait a little (another app may hold the clipboard): not for the hook thread.
+    /// </summary>
+    public static string? ReadClipboardText(int maxChars)
+    {
+        if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return null;
+        for (int attempt = 0; !OpenClipboard(IntPtr.Zero); attempt++)
+        {
+            if (attempt >= 5) return null;
+            System.Threading.Thread.Sleep(10);
+        }
+        try
+        {
+            var handle = GetClipboardData(CF_UNICODETEXT);
+            if (handle == IntPtr.Zero) return null;
+            var p = GlobalLock(handle);
+            if (p == IntPtr.Zero) return null;
+            try
+            {
+                ulong chars = (ulong)GlobalSize(handle) / 2;
+                if (chars > (ulong)maxChars) return null;
+                var s = Marshal.PtrToStringUni(p, (int)chars);
+                int end = s.IndexOf('\0');
+                return end >= 0 ? s[..end] : s;
+            }
+            finally
+            {
+                GlobalUnlock(handle);
+            }
+        }
+        finally
+        {
+            CloseClipboard();
+        }
+    }
+
     public static bool IsKeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
