@@ -49,7 +49,7 @@ internal sealed class KeyboardMonitor : IDisposable
     const int ClickSettleMs = 50;
     const int VK_RETURN = 0x0D, VK_TAB = 0x09, VK_F6 = 0x75, VK_ESCAPE = 0x1B, VK_A = 0x41, VK_DELETE = 0x2E;
     const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_UP = 0x26, VK_DOWN = 0x28, VK_L = 0x4C, VK_N = 0x4E, VK_W = 0x57;
-    const int VK_V = 0x56, VK_INSERT = 0x2D;
+    const int VK_V = 0x56, VK_X = 0x58, VK_INSERT = 0x2D;
     /// <summary>Longer clipboard text than this isn't looked at.</summary>
     const int MaxPasteChars = 1 << 20;
     const uint GUI_INMENUMODE = 0x4, GUI_SYSTEMMENUMODE = 0x8, GUI_POPUPMENUMODE = 0x10;
@@ -83,8 +83,10 @@ internal sealed class KeyboardMonitor : IDisposable
     /// <param name="CtrlEnter">Ctrl+Enter (sends, in Zoom's default setting).</param>
     /// <param name="PlainEnter">Enter alone (sends, if Zoom is set to "Enter to send").</param>
     /// <param name="Paste">Ctrl+V, Ctrl+Shift+V or Shift+Insert.</param>
+    /// <param name="Deletes">Deletes text: Backspace or Delete (alone, with Ctrl or Shift), or Ctrl+X.</param>
     readonly record struct HeldKey(KBDLLHOOKSTRUCT Data, bool Up, KeyKind Kind, char Char, bool NewLine, bool SelectAll,
-        bool FocusMove, bool PlainBackspace = false, bool PlainDelete = false, bool CtrlEnter = false, bool PlainEnter = false, bool Paste = false);
+        bool FocusMove, bool PlainBackspace = false, bool PlainDelete = false, bool CtrlEnter = false, bool PlainEnter = false, bool Paste = false,
+        bool Deletes = false);
 
     [Flags]
     enum Mods { None = 0, Shift = 1, Ctrl = 2, Alt = 4, Win = 8 }
@@ -136,6 +138,13 @@ internal sealed class KeyboardMonitor : IDisposable
     /// </summary>
     bool _markOnLine;
     int _charsAfterMark;
+    /// <summary>
+    /// Text was deleted in a way the counting above doesn't follow (Ctrl+Backspace, a selection, Delete...): the
+    /// line may now be empty, its mark gone with it. Zoom is asked before the next character.
+    /// </summary>
+    bool _lineMayBeEmpty, _checkLineMayBeEmpty;
+    /// <summary>When that deletion happened (Environment.TickCount64).</summary>
+    long _lastDelete;
     /// <summary>
     /// The last caret-moving key was a paste (its number, or 0): the caret is right after the pasted text. If that
     /// text leaves an isolate or embedding open, the next character typed is preceded by the characters closing it.
@@ -318,7 +327,7 @@ internal sealed class KeyboardMonitor : IDisposable
         _focusMayHaveMoved = true;
         _currentChatKey = null;
         _lineStartPending = _lineStartEmptyBox = _lastWasSelectAll = false;
-        _markOnLine = false;
+        _markOnLine = _lineMayBeEmpty = false;
         _pendingPaste = 0;
         _word.Clear();
     }
@@ -435,7 +444,7 @@ internal sealed class KeyboardMonitor : IDisposable
         }
 
         // Printable: only the first character after something that may have started a line is checked.
-        if (!_dirty || !(_lineStartPending || _focusMayHaveMoved))
+        if (!_dirty || !(_lineStartPending || _focusMayHaveMoved || _lineMayBeEmpty))
         {
             _dirty = false;
             if (_currentChatKey is not null && PasteClosers(take: false) is not null)
@@ -461,6 +470,7 @@ internal sealed class KeyboardMonitor : IDisposable
     {
         _pendingPaste = 0;
         _lastWasSelectAll = false; // Ctrl+A, then typing: the selection is gone, a later Backspace is just a Backspace
+        _lineMayBeEmpty = false;
         if (_markOnLine) _charsAfterMark++;
         if (_currentChatKey is not null && _typedChats.Count < 1000) _typedChats.Add(_currentChatKey);
     }
@@ -496,7 +506,17 @@ internal sealed class KeyboardMonitor : IDisposable
 
         // Only plain Backspace keeps the count of characters after the mark exact; anything else may move the caret.
         if (key.PlainBackspace && _markOnLine && _charsAfterMark > 0) _charsAfterMark--;
-        else _markOnLine = false;
+        else
+        {
+            _markOnLine = false;
+            // Any other deletion may have emptied the line, and taken its mark along (Ctrl+Backspace over the whole
+            // line, Shift+Home then Delete...): ask Zoom about the line before the next character.
+            if (key.Deletes)
+            {
+                _lineMayBeEmpty = true;
+                _lastDelete = Environment.TickCount64;
+            }
+        }
 
         if (sends || emptiedAll || key.SelectAll)
         {
@@ -626,11 +646,12 @@ internal sealed class KeyboardMonitor : IDisposable
         _checkLineStart = _lineStartPending;
         _checkEmptyBox = _lineStartEmptyBox;
         _checkFocusArrival = _focusMayHaveMoved;
-        _lineStartPending = _lineStartEmptyBox = false;
+        _checkLineMayBeEmpty = _lineMayBeEmpty && !_checkLineStart;
+        _lineStartPending = _lineStartEmptyBox = _lineMayBeEmpty = false;
 
-        // Only a line start (known from the keys) or arriving in a chat is worth asking Zoom about; and if the user
-        // typed a direction mark themselves, the line is left alone.
-        if (!(_checkLineStart || _checkFocusArrival) || Bidi.IsDirectionMark(first.Char))
+        // Only a line start (known from the keys), arriving in a chat or a line text was deleted from is worth asking
+        // Zoom about; and if the user typed a direction mark themselves, the line is left alone.
+        if (!(_checkLineStart || _checkFocusArrival || _checkLineMayBeEmpty) || Bidi.IsDirectionMark(first.Char))
         {
             Replay(insertMarker: false, keepFrom: FirstAfterDirty(start: 1),
                 closePaste: _currentChatKey is not null && !Bidi.IsDirectionMark(first.Char));
@@ -643,13 +664,18 @@ internal sealed class KeyboardMonitor : IDisposable
         // Right after a click, Zoom may not have moved its caret (and the hidden box that shows where it is) yet.
         long sinceClick = Environment.TickCount64 - _lastClick;
         if (_checkFocusArrival && sinceClick < ClickSettleMs) settleMs = Math.Max(settleMs, ClickSettleMs - (int)sinceClick);
+        // Likewise right after a deletion: Zoom may not show the shortened line yet.
+        long sinceDelete = Environment.TickCount64 - _lastDelete;
+        if (_checkLineMayBeEmpty && sinceDelete < BacklogSettleMs) settleMs = Math.Max(settleMs, BacklogSettleMs - (int)sinceDelete);
         _focusMayHaveMoved = false;
         _checkClock.Restart();
         if (_log.Enabled)
             _log.Info($"'{first.Char}' U+{(int)first.Char:X4}: checking (#{id})" +
-                $"{(_checkLineStart ? _checkEmptyBox ? ", box emptied" : ", new line" : "")}{(_checkFocusArrival ? ", focus may have moved" : "")}");
+                $"{(_checkLineStart ? _checkEmptyBox ? ", box emptied" : ", new line" : "")}{(_checkFocusArrival ? ", focus may have moved" : "")}" +
+                $"{(_checkLineMayBeEmpty ? ", text deleted" : "")}");
         uint hookThread = _threadId;
-        _inspector.Query(pid, id, mayUseLastChat, arrival: _checkFocusArrival, settleMs,
+        // "arrival" also has the inspector look at the line under the caret, which is what a deletion needs too.
+        _inspector.Query(pid, id, mayUseLastChat, arrival: _checkFocusArrival || _checkLineMayBeEmpty, settleMs,
             (rid, state) => PostThreadMessage(hookThread, WM_APP_CHECK_RESULT, rid, (int)state));
         uint timeout = _settings.UiaTimeoutMs > 0 ? (uint)_settings.UiaTimeoutMs : CheckTimeoutMsDefault;
         StartTimer(ref _timer, timeout + (uint)settleMs);
@@ -676,7 +702,11 @@ internal sealed class KeyboardMonitor : IDisposable
         // Zoom's editor also shows which line the caret is on: arriving on an empty line (clicking below the text,
         // say) starts a line too.
         bool emptyLineOnArrival = _checkFocusArrival && info?.CaretLineEmpty == true;
-        bool insert = chat && (_checkLineStart || emptyOnArrival || emptyLineOnArrival);
+        // After a deletion: the line under the caret is empty now (or, where Zoom's lines can't be read, the box is).
+        // A mark left on the line counts as text, so a line that kept its mark doesn't get a second one.
+        bool emptiedByDelete = _checkLineMayBeEmpty && chat
+                               && (info?.CaretLineEmpty == true || info?.CaretLineEmpty is null && live && state == CaretState.ChatEmpty);
+        bool insert = chat && (_checkLineStart || emptyOnArrival || emptyLineOnArrival || emptiedByDelete);
         _markOnLine = insert; // start counting characters after the mark (Replay counts the ones it sends)
         _charsAfterMark = 0;
         _lineFromEmptyBox = insert && (emptyOnArrival || _checkEmptyBox || live && state == CaretState.ChatEmpty);
@@ -902,7 +932,8 @@ internal sealed class KeyboardMonitor : IDisposable
             PlainDelete: k.vkCode == VK_DELETE && plain,
             CtrlEnter: k.vkCode == VK_RETURN && ctrl && !alt && !win,
             PlainEnter: k.vkCode == VK_RETURN && plain && !shift,
-            Paste: k.vkCode == VK_V && ctrl && !alt && !win || k.vkCode == VK_INSERT && plain && shift);
+            Paste: k.vkCode == VK_V && ctrl && !alt && !win || k.vkCode == VK_INSERT && plain && shift,
+            Deletes: k.vkCode is VK_BACK or VK_DELETE && !alt && !win || k.vkCode == VK_X && ctrl && !alt && !win);
         if (win || ctrl != alt) return flags; // shortcut (Ctrl+V, Ctrl+Z, Ctrl+Enter, Alt+Tab, ...)
 
         char? ch = Translate(k, threadId, shift, altGr);

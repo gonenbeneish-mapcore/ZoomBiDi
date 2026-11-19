@@ -88,8 +88,11 @@ Backspace, arrows…). When you paste into Zoom, the clipboard's text is scanned
     Without those (another app, or a different Zoom layout), the box's accessible name is used: the label
     followed by the draft, but only as it was when the chat was opened. So it's trusted only for chats ZoomBiDi
     hasn't seen typing in.
+  * after a deletion that may have emptied the line and taken its mark with it (Ctrl+Backspace, Delete,
+    Backspace over a selection, Ctrl+X), when the line under the caret is now empty. This is checked the same
+    way as on arrival. A line that kept its mark counts as text, so it doesn't get a second one.
 
-  Everything else (Backspace, Delete, arrows, Home/End, other shortcuts) never adds a mark.
+  Everything else (plain Backspace while typing, arrows, Home/End, other shortcuts) never adds a mark.
 * **Cheap by default.** Ordinary typing passes straight through. Only the first character of a line as defined
   above is held, while UI Automation confirms (on a separate MTA thread, through the COM API directly) that the
   focus is a Zoom message box: an Edit control named "Message to …" (or "Reply to …" in a thread), belonging to
